@@ -193,8 +193,8 @@ class BigQueryDifferTest(unittest.TestCase):
 
             self.assertEqual(mock_client.delete_table.call_count, 4)
 
-    @mock.patch('bigquery_differ.storage.fileio.BlobWriter')
-    @mock.patch('bigquery_differ.file_get_gcs_blob')
+    @mock.patch('mcf_parser.storage.fileio.BlobWriter')
+    @mock.patch('mcf_parser.file_get_gcs_blob')
     def test_open_text_stream_gcs_write_ignores_flush(self, mock_get_blob,
                                                       mock_blob_writer_cls):
         import io

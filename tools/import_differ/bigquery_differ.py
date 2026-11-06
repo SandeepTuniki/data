@@ -46,7 +46,6 @@ from collections import defaultdict
 import contextlib
 import csv
 from datetime import datetime, timedelta, timezone
-import io
 import os
 import re
 import sys
@@ -58,28 +57,21 @@ from absl import app
 from absl import flags
 from absl import logging
 from google.cloud import bigquery
-from google.cloud import storage
 import pandas as pd
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _DATA_DIR = os.path.dirname(os.path.dirname(_SCRIPT_DIR))
 sys.path.append(_SCRIPT_DIR)
 sys.path.append(os.path.join(_DATA_DIR, 'util'))
-sys.path.append(os.path.join(_DATA_DIR, 'tools', 'statvar_importer'))
+sys.path.append(os.path.join(_DATA_DIR, 'tools', 'mcf_converter'))
 
 import differ_utils
-from file_util import file_get_gcs_blob, file_get_matching, file_is_gcs
-from mcf_file_util import normalize_value
-
-OBSERVATION_KEY_PROPERTIES = [
-    'variableMeasured',
-    'observationAbout',
-    'observationDate',
-    'observationPeriod',
-    'measurementMethod',
-    'unit',
-    'scalingFactor',
-]
+from file_util import file_get_gcs_blob, file_is_gcs
+from mcf_parser import OBSERVATION_KEY_PROPERTIES
+from mcf_parser import format_raw_prop as _format_raw_prop
+from mcf_parser import iter_mcf_nodes
+from mcf_parser import normalize_prop_val as _normalize_prop_val
+from mcf_parser import open_text_stream as _open_text_stream
 
 OBS_BQ_SCHEMA = [
     bigquery.SchemaField('key_combined', 'STRING'),
@@ -112,22 +104,6 @@ def ensure_bq_dataset(bq_client: bigquery.Client,
         bq_client.create_dataset(ds, exists_ok=True)
 
 
-def _normalize_prop_val(value) -> str:
-    """Normalizes a property value string identically to ImportDiffer."""
-    if isinstance(value, list):
-        return ', '.join(sorted([_normalize_prop_val(v) for v in value]))
-    if isinstance(value, str):
-        return str(normalize_value(value))
-    return str(value) if value is not None else ''
-
-
-def _format_raw_prop(value) -> str:
-    """Formats a property value without numeric/namespace coercion."""
-    if isinstance(value, list):
-        return ', '.join(str(v).strip() for v in value)
-    return str(value).strip() if value is not None else ''
-
-
 def _flush_node_to_csv(node: Dict[str, Any], obs_writer: csv.writer,
                        schema_writer: csv.writer) -> Tuple[int, int]:
     """Writes a single parsed MCF node to either the observation or schema CSV writer."""
@@ -146,6 +122,9 @@ def _flush_node_to_csv(node: Dict[str, Any], obs_writer: csv.writer,
         obs_writer.writerow([key_combined, var_measured, val, node_id, dcid])
         return 1, 0
     else:
+        # Legacy: keeps quotes from text-typed dcids (e.g. `dcid:"Foo"`).
+        # The MCF converter (tools/mcf_converter) writes clean dcids instead.
+        # Remove this path once the differ reads the converter's tables.
         raw_id = node.get('dcid') or node.get('Node', '')
         dcid = _normalize_prop_val(raw_id)
         if dcid and not dcid.startswith('dcid:'):
@@ -157,44 +136,6 @@ def _flush_node_to_csv(node: Dict[str, Any], obs_writer: csv.writer,
         value_combined = ';'.join(props)
         schema_writer.writerow([dcid, value_combined])
         return 0, 1
-
-
-@contextlib.contextmanager
-def _open_text_stream(path: str, mode: str = 'r'):
-    """Opens a local file or gs:// URI as a streaming UTF-8 text file without /tmp buffering."""
-    newline = '' if mode.startswith('w') else None
-    if file_is_gcs(path):
-        if mode.startswith('r'):
-            blob = file_get_gcs_blob(path, exists=True)
-            if not blob:
-                raise FileNotFoundError(f'GCS blob not found: {path}')
-            raw_stream = storage.fileio.BlobReader(blob)
-            with io.TextIOWrapper(raw_stream,
-                                  encoding='utf-8',
-                                  errors='replace') as stream:
-                yield stream
-        elif mode.startswith('w'):
-            blob = file_get_gcs_blob(path, exists=False)
-            if not blob:
-                raise RuntimeError(
-                    f'Failed to create GCS blob for write: {path}')
-            raw_stream = storage.fileio.BlobWriter(blob, ignore_flush=True)
-            with io.TextIOWrapper(raw_stream, encoding='utf-8',
-                                  newline=newline) as stream:
-                yield stream
-        else:
-            raise ValueError(f'Unsupported mode for GCS stream: {mode}')
-    else:
-        if mode.startswith('w'):
-            parent_dir = os.path.dirname(path)
-            if parent_dir:
-                os.makedirs(parent_dir, exist_ok=True)
-        with open(path,
-                  mode=mode,
-                  encoding='utf-8',
-                  newline=newline,
-                  errors='replace' if mode.startswith('r') else None) as stream:
-            yield stream
 
 
 def _remove_temp_file(path: str) -> None:
@@ -213,7 +154,6 @@ def _remove_temp_file(path: str) -> None:
 def stream_mcf_to_csv(mcf_pattern: str, obs_csv_path: str,
                       schema_csv_path: str) -> Tuple[int, int]:
     """Streams MCF files node-by-node into observation and schema CSVs in O(1) memory."""
-    mcf_files = file_get_matching(mcf_pattern)
     total_obs = 0
     total_schema = 0
 
@@ -225,42 +165,10 @@ def stream_mcf_to_csv(mcf_pattern: str, obs_csv_path: str,
             ['key_combined', 'variableMeasured', 'value', 'node_id', 'dcid'])
         schema_writer.writerow(['dcid', 'value_combined'])
 
-        for mcf_file in mcf_files:
-            logging.info('Streaming MCF file to CSV: %s', mcf_file)
-            with _open_text_stream(mcf_file, mode='r') as in_f:
-                current_node: Dict[str, Any] = {}
-                for raw_line in in_f:
-                    line = raw_line.strip()
-                    if not line or line.startswith('#'):
-                        if current_node:
-                            o_inc, s_inc = _flush_node_to_csv(
-                                current_node, obs_writer, schema_writer)
-                            total_obs += o_inc
-                            total_schema += s_inc
-                            current_node = {}
-                        continue
-                    if ':' in line:
-                        k, v = line.split(':', 1)
-                        k = k.strip()
-                        v = v.strip()
-                        if k == 'Node' and current_node:
-                            o_inc, s_inc = _flush_node_to_csv(
-                                current_node, obs_writer, schema_writer)
-                            total_obs += o_inc
-                            total_schema += s_inc
-                            current_node = {}
-                        if k in current_node:
-                            if isinstance(current_node[k], list):
-                                current_node[k].append(v)
-                            else:
-                                current_node[k] = [current_node[k], v]
-                        else:
-                            current_node[k] = v
-                if current_node:
-                    o_inc, s_inc = _flush_node_to_csv(current_node, obs_writer,
-                                                      schema_writer)
-                    total_obs += o_inc
-                    total_schema += s_inc
+        for node in iter_mcf_nodes(mcf_pattern):
+            o_inc, s_inc = _flush_node_to_csv(node, obs_writer, schema_writer)
+            total_obs += o_inc
+            total_schema += s_inc
 
     logging.info('Completed streaming MCF to CSV: %d obs, %d schema nodes',
                  total_obs, total_schema)
