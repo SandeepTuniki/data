@@ -72,103 +72,28 @@ _IMPORT_DIR_CHARS = 'A-Za-z0-9-_/'
 _SIMPLE_IMPORT_DIR = '/simple_imports/'
 _SIMPLE_IMPORT_CONFIG_PREFIX = 'import_config'
 
-# Machine types that Cloud Batch jobs can run on (cloud_batch.py).
+# Machine types that Cloud Batch jobs can run on, as (name, CPUs, memory in
+# GiB) tuples (cloud_batch.py).
 _GCE_MACHINE_TYPES = (
-    {
-        'name': 'n2-standard-2',
-        'cpus': 2,
-        'memory_gib': 8
-    },
-    {
-        'name': 'n2-standard-4',
-        'cpus': 4,
-        'memory_gib': 16
-    },
-    {
-        'name': 'n2-standard-8',
-        'cpus': 8,
-        'memory_gib': 32
-    },
-    {
-        'name': 'n2-standard-16',
-        'cpus': 16,
-        'memory_gib': 64
-    },
-    {
-        'name': 'n2-standard-32',
-        'cpus': 32,
-        'memory_gib': 128
-    },
-    {
-        'name': 'n2-standard-48',
-        'cpus': 48,
-        'memory_gib': 192
-    },
-    {
-        'name': 'n2-standard-64',
-        'cpus': 64,
-        'memory_gib': 256
-    },
-    {
-        'name': 'n2-highmem-2',
-        'cpus': 2,
-        'memory_gib': 16
-    },
-    {
-        'name': 'n2-highmem-4',
-        'cpus': 4,
-        'memory_gib': 32
-    },
-    {
-        'name': 'n2-highmem-8',
-        'cpus': 8,
-        'memory_gib': 64
-    },
-    {
-        'name': 'n2-highmem-16',
-        'cpus': 16,
-        'memory_gib': 128
-    },
-    {
-        'name': 'n2-highmem-32',
-        'cpus': 32,
-        'memory_gib': 256
-    },
-    {
-        'name': 'n2-highmem-48',
-        'cpus': 48,
-        'memory_gib': 384
-    },
-    {
-        'name': 'n2-highmem-64',
-        'cpus': 64,
-        'memory_gib': 512
-    },
-    {
-        'name': 'n2-highcpu-2',
-        'cpus': 2,
-        'memory_gib': 2
-    },
-    {
-        'name': 'n2-highcpu-4',
-        'cpus': 4,
-        'memory_gib': 4
-    },
-    {
-        'name': 'n2-highcpu-8',
-        'cpus': 8,
-        'memory_gib': 8
-    },
-    {
-        'name': 'n2-highcpu-16',
-        'cpus': 16,
-        'memory_gib': 16
-    },
-    {
-        'name': 'n2-highcpu-32',
-        'cpus': 32,
-        'memory_gib': 32
-    },
+    ('n2-standard-2', 2, 8),
+    ('n2-standard-4', 4, 16),
+    ('n2-standard-8', 8, 32),
+    ('n2-standard-16', 16, 64),
+    ('n2-standard-32', 32, 128),
+    ('n2-standard-48', 48, 192),
+    ('n2-standard-64', 64, 256),
+    ('n2-highmem-2', 2, 16),
+    ('n2-highmem-4', 4, 32),
+    ('n2-highmem-8', 8, 64),
+    ('n2-highmem-16', 16, 128),
+    ('n2-highmem-32', 32, 256),
+    ('n2-highmem-48', 48, 384),
+    ('n2-highmem-64', 64, 512),
+    ('n2-highcpu-2', 2, 2),
+    ('n2-highcpu-4', 4, 4),
+    ('n2-highcpu-8', 8, 8),
+    ('n2-highcpu-16', 16, 16),
+    ('n2-highcpu-32', 32, 32),
 )
 
 
@@ -841,8 +766,8 @@ def _is_simple_import_config(script_path: str) -> bool:
 
 def _fits_some_machine(cpu: float, memory_gib: float) -> bool:
     """Returns True if some machine type has at least this CPU and memory."""
-    return any(m['cpus'] >= cpu and m['memory_gib'] >= memory_gib
-               for m in _GCE_MACHINE_TYPES)
+    return any(machine_cpus >= cpu and machine_memory_gib >= memory_gib
+               for _, machine_cpus, machine_memory_gib in _GCE_MACHINE_TYPES)
 
 
 def _matches_type(value: Any, expected_type: Any) -> bool:

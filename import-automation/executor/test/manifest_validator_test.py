@@ -662,8 +662,10 @@ class ExecutorRulesInSyncTest(unittest.TestCase):
                          cloud_run_simple_import._DEFAULT_CONFIG_PREFIX)
 
     def test_machine_types_match_cloud_batch(self):
+        executor_machine_types = [(m['name'], m['cpus'], m['memory_gib'])
+                                  for m in cloud_batch._GCE_MACHINE_TYPES]
         self.assertEqual(list(manifest_validator._GCE_MACHINE_TYPES),
-                         list(cloud_batch._GCE_MACHINE_TYPES))
+                         executor_machine_types)
 
 
 class ValidateManifestsCliTest(ManifestValidatorTestBase):
