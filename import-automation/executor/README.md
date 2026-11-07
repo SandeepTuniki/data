@@ -81,6 +81,27 @@ Run `./schedule_update_import.sh -u datcom-import-automation-prod scripts/us_usd
 
 Run `. run_local_executor.sh --help` for usage.
 
+## Validating Manifests
+
+`app/executor/manifest_validator.py` checks `manifest.json` files for problems
+such as unknown or missing fields, wrong value types, invalid cron schedules,
+`resource_limits` that no machine type can satisfy, unknown `config_override`
+settings, missing `validation_config_file`s and duplicate import names.
+
+Run it from the repository root, with the executor's requirements installed:
+
+```
+# Validate the manifests you are working on
+python import-automation/executor/app/executor/manifest_validator.py statvar_imports/<import>/manifest.json
+
+# Validate all manifests under statvar_imports/ and scripts/
+python import-automation/executor/app/executor/manifest_validator.py --all
+```
+
+The exit code is 0 if all manifests are valid, 1 if errors were found and 2
+for invalid usage. Other code can also import the module and use
+`ManifestValidator(repo_dir).validate()` directly.
+
 ## Running Tests
 
 ```

@@ -1,0 +1,983 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Validates import manifest.json files.
+
+Checks each manifest for structural problems (unknown or missing fields,
+wrong value types), invalid settings (cron schedules, resource limits,
+executor config overrides), missing validation config files and duplicate
+import names across the repository.
+
+The module is self-contained: the only executor code it uses is
+configs.ExecutorConfig, which defines the settings that config_override may
+change. A few rules that the executor also applies (allowed name characters,
+simple import detection and machine types) are defined here as constants;
+manifest_validator_test.py checks that they still match the executor.
+
+The checks can be used programmatically through ManifestValidator, or from the
+command line (from the repository root):
+
+  # Validate specific manifests, e.g. while editing them:
+  python import-automation/executor/app/executor/manifest_validator.py \\
+      statvar_imports/who/adolescent_birth_rate/manifest.json
+
+  # Validate all manifests under statvar_imports/ and scripts/:
+  python import-automation/executor/app/executor/manifest_validator.py --all
+
+Exit codes: 0 if all manifests are valid, 1 if errors were found, 2 for
+invalid usage.
+"""
+
+import argparse
+import collections
+import dataclasses
+import enum
+import json
+import os
+import re
+import shlex
+import sys
+import typing
+from typing import Any, Dict, List, Optional, TextIO, Tuple
+
+if __name__ == '__main__':
+    # When run as a script, make the executor's 'app' package importable.
+    sys.path.insert(
+        0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+
+from croniter import croniter
+
+from app import configs
+
+# Top-level folders (relative to the repository root) that contain manifests.
+MANIFEST_ROOTS = ('statvar_imports', 'scripts')
+# Maximum number of folders between a manifest root and a manifest.
+MAX_MANIFEST_DEPTH = 5
+MANIFEST_FILENAME = 'manifest.json'
+
+_ALLOWED_TOP_LEVEL_FIELDS = frozenset({'import_specifications'})
+
+# Fields of an import specification that are read by the import automation
+# code, plus '_comment' for human-readable notes.
+_ALLOWED_SPEC_FIELDS = frozenset({
+    '_comment',
+    'config_override',
+    'cron_schedule',
+    'curator_emails',
+    'data_download_url',
+    'image',
+    'import_inputs',
+    'import_name',
+    'provenance_description',
+    'provenance_url',
+    'resource_limits',
+    'scripts',
+    'source_files',
+    'user_script_timeout',
+    'validation_config_file',
+})
+
+_REQUIRED_SPEC_FIELDS = (
+    'import_name',
+    'curator_emails',
+    'provenance_url',
+    'provenance_description',
+    'scripts',
+    'import_inputs',
+)
+
+_STRING_FIELDS = ('import_name', 'provenance_url', 'provenance_description',
+                  'image')
+_STRING_LIST_FIELDS = ('scripts', 'source_files', 'data_download_url')
+
+_RESOURCE_NUMBER_FIELDS = ('cpu', 'memory', 'disk')
+_ALLOWED_RESOURCE_FIELDS = frozenset(_RESOURCE_NUMBER_FIELDS + ('machine',))
+
+_SCRIPT_EXTENSIONS = ('.py', '.sh')
+_SIMPLE_IMPORT_EXTENSION = '.json'
+
+# The constants below mirror rules applied by other executor modules. Keep them
+# in sync; manifest_validator_test.py fails if they differ.
+
+# Characters allowed in import names and in manifest folder paths
+# (import_target.py).
+_IMPORT_NAME_CHARS = 'A-Za-z0-9-_'
+_IMPORT_DIR_CHARS = 'A-Za-z0-9-_/'
+_IMPORT_NAME_REGEX = re.compile(f'[{_IMPORT_NAME_CHARS}]+')
+_IMPORT_DIR_REGEX = re.compile(f'[{_IMPORT_DIR_CHARS}]+')
+
+# A .json script is run as a simple import if its path contains both of these
+# strings (cloud_run_simple_import.py).
+_SIMPLE_IMPORT_DIR = '/simple_imports/'
+_SIMPLE_IMPORT_CONFIG_PREFIX = 'import_config'
+
+# Machine types that Cloud Batch jobs can run on (cloud_batch.py).
+_GCE_MACHINE_TYPES = (
+    {
+        'name': 'n2-standard-2',
+        'cpus': 2,
+        'memory_gib': 8
+    },
+    {
+        'name': 'n2-standard-4',
+        'cpus': 4,
+        'memory_gib': 16
+    },
+    {
+        'name': 'n2-standard-8',
+        'cpus': 8,
+        'memory_gib': 32
+    },
+    {
+        'name': 'n2-standard-16',
+        'cpus': 16,
+        'memory_gib': 64
+    },
+    {
+        'name': 'n2-standard-32',
+        'cpus': 32,
+        'memory_gib': 128
+    },
+    {
+        'name': 'n2-standard-48',
+        'cpus': 48,
+        'memory_gib': 192
+    },
+    {
+        'name': 'n2-standard-64',
+        'cpus': 64,
+        'memory_gib': 256
+    },
+    {
+        'name': 'n2-highmem-2',
+        'cpus': 2,
+        'memory_gib': 16
+    },
+    {
+        'name': 'n2-highmem-4',
+        'cpus': 4,
+        'memory_gib': 32
+    },
+    {
+        'name': 'n2-highmem-8',
+        'cpus': 8,
+        'memory_gib': 64
+    },
+    {
+        'name': 'n2-highmem-16',
+        'cpus': 16,
+        'memory_gib': 128
+    },
+    {
+        'name': 'n2-highmem-32',
+        'cpus': 32,
+        'memory_gib': 256
+    },
+    {
+        'name': 'n2-highmem-48',
+        'cpus': 48,
+        'memory_gib': 384
+    },
+    {
+        'name': 'n2-highmem-64',
+        'cpus': 64,
+        'memory_gib': 512
+    },
+    {
+        'name': 'n2-highcpu-2',
+        'cpus': 2,
+        'memory_gib': 2
+    },
+    {
+        'name': 'n2-highcpu-4',
+        'cpus': 4,
+        'memory_gib': 4
+    },
+    {
+        'name': 'n2-highcpu-8',
+        'cpus': 8,
+        'memory_gib': 8
+    },
+    {
+        'name': 'n2-highcpu-16',
+        'cpus': 16,
+        'memory_gib': 16
+    },
+    {
+        'name': 'n2-highcpu-32',
+        'cpus': 32,
+        'memory_gib': 32
+    },
+)
+
+
+class Scope(enum.Enum):
+    """What a check looks at."""
+    # The manifest as a whole: (manifest_path, manifest) -> messages.
+    MANIFEST = 'manifest'
+    # One import specification: (ImportSpec) -> messages.
+    IMPORT = 'import'
+    # All manifests in the repository: (manifests) -> ManifestErrors.
+    REPO = 'repo'
+
+
+@dataclasses.dataclass(frozen=True)
+class Check:
+    """A validation check run by ManifestValidator.
+
+    Attributes:
+        id: Stable identifier, shown in error messages. The check is
+            implemented by the ManifestValidator method named
+            '_check_<id with "-" replaced by "_">'.
+        scope: What the check looks at.
+        description: What the check verifies.
+        enabled: Whether the check runs.
+        reason: Why the check is disabled. Required if enabled is False.
+    """
+    id: str
+    scope: Scope
+    description: str
+    enabled: bool = True
+    reason: str = ''
+
+    @property
+    def method_name(self) -> str:
+        return '_check_' + self.id.replace('-', '_')
+
+
+@dataclasses.dataclass(frozen=True, order=True)
+class ManifestError:
+    """A validation error found in a manifest.
+
+    Attributes:
+        manifest_path: Path to the manifest, relative to the repository root.
+        import_name: Import the error belongs to, or None for errors that
+            apply to the whole manifest. Imports without a valid name are
+            identified by their position, e.g. 'import_specifications[1]'.
+        message: Description of the problem.
+        check: Id of the check that found the error, or None for problems
+            with the requested path itself (e.g. file not found).
+    """
+    manifest_path: str
+    import_name: Optional[str]
+    message: str
+    check: Optional[str] = None
+
+    def __str__(self) -> str:
+        location = self.manifest_path
+        if self.import_name is not None:
+            location += f' [{self.import_name}]'
+        suffix = f' ({self.check})' if self.check else ''
+        return f'{location}: {self.message}{suffix}'
+
+
+@dataclasses.dataclass(frozen=True)
+class ImportSpec:
+    """One import specification inside a manifest.
+
+    Attributes:
+        manifest_path: Path to the manifest, relative to the repository root.
+        label: The import_name, or the position of the specification (e.g.
+            'import_specifications[1]') if it has no valid name.
+        abs_import_dir: Absolute path to the folder containing the manifest.
+            Relative paths in the specification are resolved against it.
+        fields: The specification's JSON object.
+    """
+    manifest_path: str
+    label: str
+    abs_import_dir: str
+    fields: Dict[str, Any]
+
+
+# Ids of the checks that always run, because no other check can run without
+# them. They are not listed in ManifestValidator.CHECKS.
+VALID_JSON_CHECK = 'valid-json'
+MANIFEST_STRUCTURE_CHECK = 'manifest-structure'
+
+
+class ManifestValidator:
+    """Validates the manifests of a data repository.
+
+    Example:
+        validator = ManifestValidator('/path/to/data')
+        for error in validator.validate():
+            print(error)
+    """
+
+    # Every check the validator runs, in order. Two more checks always run
+    # first and cannot be disabled: 'valid-json' (the file is valid JSON) and
+    # 'manifest-structure' (it is an object with a non-empty
+    # "import_specifications" list of objects).
+    #
+    # To turn a check off temporarily, set enabled=False and give a reason,
+    # e.g. reason='b/123456: too noisy until the cleanup lands'.
+    CHECKS = (
+        Check('folder-path-chars', Scope.MANIFEST,
+              'Folder path only uses letters, digits, "_", "-" and "/".'),
+        Check('top-level-fields', Scope.MANIFEST,
+              'Only "import_specifications" is allowed at the top level.'),
+        Check('unknown-fields', Scope.IMPORT,
+              'Imports only have known fields (plus "_comment").'),
+        Check('required-fields', Scope.IMPORT,
+              'Required fields are present and not empty.'),
+        Check('curator-emails-type', Scope.IMPORT,
+              'curator_emails is a list of strings.'),
+        Check('field-types', Scope.IMPORT,
+              'Other fields have the right basic types.'),
+        Check('import-name-chars', Scope.IMPORT,
+              'import_name only uses letters, digits, "_" and "-".'),
+        Check('unique-import-names', Scope.REPO,
+              'import_name is unique across all manifests.'),
+        Check('script-syntax', Scope.IMPORT,
+              'Script entries are non-empty and can be split into words.'),
+        Check('script-type', Scope.IMPORT,
+              'Scripts end in .py or .sh, or are simple import configs.'),
+        Check('cron-schedule', Scope.IMPORT,
+              'cron_schedule, if set, is accepted by croniter.'),
+        Check('resource-limits-types', Scope.IMPORT,
+              'resource_limits has known fields with valid types.'),
+        Check('resource-limits-size', Scope.IMPORT,
+              'resource_limits cpu and memory fit on a machine type.'),
+        Check('config-override', Scope.IMPORT,
+              'config_override sets real executor settings, valid types.'),
+        Check('validation-config-file', Scope.IMPORT,
+              'validation_config_file, if set, exists.'),
+        Check('import-inputs', Scope.IMPORT,
+              'import_inputs values are strings or lists of strings.'),
+    )
+
+    def __init__(self, repo_dir: str):
+        """Initializes the validator.
+
+        Args:
+            repo_dir: Path to the root of the data repository.
+
+        Raises:
+            ValueError: CHECKS is inconsistent, e.g. a check has no method.
+        """
+        self._repo_dir = os.path.abspath(repo_dir)
+        self._enabled_checks = _resolve_checks(self, self.CHECKS)
+        # Settings that config_override may change, with their types.
+        type_hints = typing.get_type_hints(configs.ExecutorConfig)
+        self._executor_setting_types = {
+            field.name: type_hints[field.name]
+            for field in dataclasses.fields(configs.ExecutorConfig)
+        }
+
+    # Public methods.
+
+    @classmethod
+    def disabled_checks(cls) -> List[Check]:
+        """Returns the checks in CHECKS that are turned off."""
+        return [check for check in cls.CHECKS if not check.enabled]
+
+    def find_manifests(self) -> List[str]:
+        """Returns the manifests under MANIFEST_ROOTS.
+
+        Searches at most MAX_MANIFEST_DEPTH folders below each root, skips
+        hidden folders (such as .env) and does not follow symbolic links.
+
+        Returns:
+            Sorted list of manifest paths relative to the repository root,
+            using '/' as the separator.
+        """
+        manifests = []
+        for root in MANIFEST_ROOTS:
+            root_dir = os.path.join(self._repo_dir, root)
+            for dir_path, dir_names, file_names in os.walk(root_dir):
+                rel_dir = os.path.relpath(dir_path, root_dir)
+                depth = 0 if rel_dir == os.curdir else len(rel_dir.split(
+                    os.sep))
+                if depth >= MAX_MANIFEST_DEPTH:
+                    dir_names[:] = []
+                else:
+                    dir_names[:] = [
+                        d for d in dir_names if not d.startswith('.')
+                    ]
+                if MANIFEST_FILENAME in file_names:
+                    manifests.append(
+                        self._to_repo_path(
+                            os.path.join(dir_path, MANIFEST_FILENAME)))
+        return sorted(manifests)
+
+    def validate(
+            self,
+            manifest_paths: Optional[List[str]] = None) -> List[ManifestError]:
+        """Validates manifests, including repository-wide checks.
+
+        All manifests found by find_manifests() are read so that
+        repository-wide checks (such as duplicate import names) work, but
+        errors are only returned for the requested manifests.
+
+        Args:
+            manifest_paths: Manifests to validate, as absolute paths or paths
+                relative to the current working directory. If None, all
+                manifests found by find_manifests() are validated.
+
+        Returns:
+            Errors found in the requested manifests, sorted.
+        """
+        all_manifests = self.find_manifests()
+        errors = []
+        if manifest_paths is None:
+            requested = set(all_manifests)
+        else:
+            requested = set()
+            for path in manifest_paths:
+                repo_path, error = self._resolve_requested_path(path)
+                if error:
+                    errors.append(error)
+                else:
+                    requested.add(repo_path)
+
+        parsed = {}
+        for path in sorted(set(all_manifests) | requested):
+            manifest, load_errors = self._load_manifest(path)
+            if path in requested:
+                errors.extend(load_errors)
+            if manifest is not None:
+                parsed[path] = manifest
+
+        for path in sorted(requested):
+            if path in parsed:
+                errors.extend(self._run_manifest_checks(path, parsed[path]))
+
+        errors.extend(error for error in self._run_repo_checks(parsed)
+                      if error.manifest_path in requested)
+        return sorted(errors)
+
+    def validate_manifest(self, manifest_path: str) -> List[ManifestError]:
+        """Validates a single manifest, without the repository-wide checks.
+
+        Args:
+            manifest_path: Path to the manifest, relative to the repository
+                root.
+
+        Returns:
+            Errors found in the manifest, sorted.
+        """
+        manifest, errors = self._load_manifest(manifest_path)
+        if manifest is not None:
+            errors.extend(self._run_manifest_checks(manifest_path, manifest))
+        return sorted(errors)
+
+    # Loading manifests and running checks.
+
+    def _to_repo_path(self, path: str) -> str:
+        """Returns path relative to the repository root, with '/' separators."""
+        return os.path.relpath(path, self._repo_dir).replace(os.sep, '/')
+
+    def _resolve_requested_path(
+            self, path: str) -> Tuple[str, Optional[ManifestError]]:
+        """Converts a user-supplied manifest path to a repository path.
+
+        Returns:
+            A (repo_path, error) tuple. error is set if the path is outside
+            the repository or is not a file.
+        """
+        abs_path = os.path.abspath(path)
+        repo_path = self._to_repo_path(abs_path)
+        if repo_path == '..' or repo_path.startswith('../'):
+            return '', ManifestError(path, None,
+                                     'manifest is outside the repository')
+        if not os.path.isfile(abs_path):
+            return '', ManifestError(repo_path, None, 'file not found')
+        return repo_path, None
+
+    def _load_manifest(
+            self,
+            manifest_path: str) -> Tuple[Optional[Any], List[ManifestError]]:
+        """Reads and parses a manifest (the 'valid-json' check)."""
+
+        def error(message: str) -> ManifestError:
+            return ManifestError(manifest_path, None, message, VALID_JSON_CHECK)
+
+        try:
+            with open(os.path.join(self._repo_dir, manifest_path),
+                      encoding='utf-8') as f:
+                return json.load(f), []
+        except (OSError, UnicodeDecodeError) as e:
+            return None, [error(f'cannot read file: {e}')]
+        except json.JSONDecodeError as e:
+            return None, [error(f'invalid JSON: {e}')]
+
+    def _run_manifest_checks(self, manifest_path: str,
+                             manifest: Any) -> List[ManifestError]:
+        """Runs the manifest and import checks on a parsed manifest."""
+        errors = []
+        for check in self._enabled_checks[Scope.MANIFEST]:
+            errors.extend(
+                ManifestError(manifest_path, None, message, check.id)
+                for message in getattr(self, check.method_name)(manifest_path,
+                                                                manifest))
+
+        def structure_error(message: str,
+                            label: Optional[str] = None) -> ManifestError:
+            return ManifestError(manifest_path, label, message,
+                                 MANIFEST_STRUCTURE_CHECK)
+
+        if not isinstance(manifest, dict):
+            errors.append(structure_error('manifest must be a JSON object'))
+            return errors
+        specs = manifest.get('import_specifications')
+        if not isinstance(specs, list) or not specs:
+            errors.append(
+                structure_error(
+                    '"import_specifications" must be a non-empty list'))
+            return errors
+
+        abs_import_dir = os.path.join(self._repo_dir,
+                                      os.path.dirname(manifest_path))
+        for index, fields in enumerate(specs):
+            label = _spec_label(fields, index)
+            if not isinstance(fields, dict):
+                errors.append(
+                    structure_error(
+                        'import specification must be a JSON object', label))
+                continue
+            spec = ImportSpec(manifest_path, label, abs_import_dir, fields)
+            for check in self._enabled_checks[Scope.IMPORT]:
+                errors.extend(
+                    ManifestError(manifest_path, label, message, check.id)
+                    for message in getattr(self, check.method_name)(spec))
+        return errors
+
+    def _run_repo_checks(self, manifests: Dict[str,
+                                               Any]) -> List[ManifestError]:
+        """Runs the repository-wide checks on all parsed manifests."""
+        errors = []
+        for check in self._enabled_checks[Scope.REPO]:
+            errors.extend(
+                dataclasses.replace(error, check=check.id)
+                for error in getattr(self, check.method_name)(manifests))
+        return errors
+
+    # Manifest checks: (manifest_path, manifest) -> error messages.
+
+    def _check_folder_path_chars(self, manifest_path: str,
+                                 manifest: Any) -> List[str]:
+        del manifest  # Unused.
+        import_dir = os.path.dirname(manifest_path)
+        if not _IMPORT_DIR_REGEX.fullmatch(import_dir):
+            return [
+                f'folder path "{import_dir}" may only contain letters, '
+                'digits, "_", "-" and "/"'
+            ]
+        return []
+
+    def _check_top_level_fields(self, manifest_path: str,
+                                manifest: Any) -> List[str]:
+        del manifest_path  # Unused.
+        if not isinstance(manifest, dict):
+            return []
+        return [
+            f'unknown top-level field "{field}"; only '
+            '"import_specifications" is allowed at the top level'
+            for field in sorted(set(manifest) - _ALLOWED_TOP_LEVEL_FIELDS)
+        ]
+
+    # Import checks: (ImportSpec) -> error messages.
+
+    def _check_unknown_fields(self, spec: ImportSpec) -> List[str]:
+        return [
+            f'unknown field "{field}"'
+            for field in sorted(set(spec.fields) - _ALLOWED_SPEC_FIELDS)
+        ]
+
+    def _check_required_fields(self, spec: ImportSpec) -> List[str]:
+        return [
+            f'required field "{field}" is missing or empty'
+            for field in _REQUIRED_SPEC_FIELDS
+            if _is_empty(spec.fields.get(field))
+        ]
+
+    def _check_curator_emails_type(self, spec: ImportSpec) -> List[str]:
+        if 'curator_emails' in spec.fields and not _is_string_list(
+                spec.fields['curator_emails']):
+            return ['"curator_emails" must be a list of strings']
+        return []
+
+    def _check_field_types(self, spec: ImportSpec) -> List[str]:
+        fields = spec.fields
+        messages = []
+        for field in _STRING_FIELDS:
+            if field in fields and not isinstance(fields[field], str):
+                messages.append(f'"{field}" must be a string')
+        for field in _STRING_LIST_FIELDS:
+            if field in fields and not _is_string_list(fields[field]):
+                messages.append(f'"{field}" must be a list of strings')
+        if 'user_script_timeout' in fields and not _is_positive_number(
+                fields['user_script_timeout']):
+            messages.append('"user_script_timeout" must be a positive number')
+        return messages
+
+    def _check_import_name_chars(self, spec: ImportSpec) -> List[str]:
+        name = spec.fields.get('import_name')
+        if not isinstance(name, str) or not name:
+            return []
+        if not _IMPORT_NAME_REGEX.fullmatch(name):
+            return [
+                f'"import_name" "{name}" may only contain letters, digits, '
+                '"_" and "-"'
+            ]
+        return []
+
+    def _check_script_syntax(self, spec: ImportSpec) -> List[str]:
+        messages = []
+        for entry in _script_entries(spec):
+            if not entry.strip():
+                messages.append('script entry is empty')
+                continue
+            try:
+                shlex.split(entry)
+            except ValueError as e:
+                messages.append(f'cannot parse script entry "{entry}": {e}')
+        return messages
+
+    def _check_script_type(self, spec: ImportSpec) -> List[str]:
+        messages = []
+        for entry in _script_entries(spec):
+            if not entry.strip():
+                continue
+            # The executor picks the interpreter from the first space-separated
+            # word of the entry.
+            script = entry.split(' ')[0]
+            if script.endswith(_SCRIPT_EXTENSIONS):
+                continue
+            if script.endswith(_SIMPLE_IMPORT_EXTENSION) and (
+                    _is_simple_import_config(
+                        os.path.join(spec.abs_import_dir, script))):
+                continue
+            messages.append(
+                f'script "{script}" must end in .py or .sh (or be a simple '
+                'import config)')
+        return messages
+
+    def _check_cron_schedule(self, spec: ImportSpec) -> List[str]:
+        if 'cron_schedule' not in spec.fields:
+            return []
+        schedule = spec.fields['cron_schedule']
+        if not isinstance(schedule, str) or not croniter.is_valid(schedule):
+            return [
+                f'"cron_schedule" {json.dumps(schedule)} is not a valid cron '
+                'expression'
+            ]
+        return []
+
+    def _check_resource_limits_types(self, spec: ImportSpec) -> List[str]:
+        if 'resource_limits' not in spec.fields:
+            return []
+        limits = spec.fields['resource_limits']
+        if not isinstance(limits, dict):
+            return ['"resource_limits" must be an object']
+        messages = [
+            f'unknown field "resource_limits.{field}"'
+            for field in sorted(set(limits) - _ALLOWED_RESOURCE_FIELDS)
+        ]
+        for field in _RESOURCE_NUMBER_FIELDS:
+            if field in limits and not _is_positive_number(limits[field]):
+                messages.append(f'"resource_limits.{field}" must be a positive '
+                                'number')
+        if 'machine' in limits and not isinstance(limits['machine'], str):
+            messages.append('"resource_limits.machine" must be a string')
+        return messages
+
+    def _check_resource_limits_size(self, spec: ImportSpec) -> List[str]:
+        limits = spec.fields.get('resource_limits')
+        if not isinstance(limits, dict):
+            return []
+        # Missing cpu or memory are filled in with defaults by the executor, so
+        # only the values that are set need to fit on a machine type.
+        requested = {
+            field: limits[field]
+            for field in ('cpu', 'memory')
+            if field in limits
+        }
+        if not requested or not all(
+                _is_positive_number(v) for v in requested.values()):
+            return []
+        if _fits_some_machine(requested.get('cpu', 0),
+                              requested.get('memory', 0)):
+            return []
+        described = ' and '.join(
+            f'{field}={value}' for field, value in requested.items())
+        return [
+            f'"resource_limits" ({described}) is larger than the largest '
+            'available machine type'
+        ]
+
+    def _check_config_override(self, spec: ImportSpec) -> List[str]:
+        if 'config_override' not in spec.fields:
+            return []
+        override = spec.fields['config_override']
+        if not isinstance(override, dict):
+            return ['"config_override" must be an object']
+        messages = []
+        for key in sorted(override):
+            expected_type = self._executor_setting_types.get(key)
+            if expected_type is None:
+                messages.append(f'"config_override.{key}" is not an executor '
+                                'setting')
+            elif not _matches_type(override[key], expected_type):
+                messages.append(f'"config_override.{key}" must be of type '
+                                f'{_type_name(expected_type)}')
+        return messages
+
+    def _check_validation_config_file(self, spec: ImportSpec) -> List[str]:
+        if 'validation_config_file' not in spec.fields:
+            return []
+        path = spec.fields['validation_config_file']
+        if not isinstance(path, str):
+            return ['"validation_config_file" must be a string']
+        if not os.path.isfile(os.path.join(spec.abs_import_dir, path)):
+            return [f'"validation_config_file" "{path}" does not exist']
+        return []
+
+    def _check_import_inputs(self, spec: ImportSpec) -> List[str]:
+        if 'import_inputs' not in spec.fields:
+            return []
+        inputs = spec.fields['import_inputs']
+        if not isinstance(inputs, list):
+            return ['"import_inputs" must be a list']
+        messages = []
+        for index, item in enumerate(inputs):
+            if not isinstance(item, dict):
+                messages.append(f'"import_inputs[{index}]" must be an object')
+                continue
+            for key in sorted(item):
+                value = item[key]
+                if not isinstance(value, str) and not _is_string_list(value):
+                    messages.append(f'"import_inputs[{index}].{key}" must be '
+                                    'a string or a list of strings')
+        return messages
+
+    # Repository checks: (manifests by path) -> ManifestErrors.
+
+    def _check_unique_import_names(
+            self, manifests: Dict[str, Any]) -> List[ManifestError]:
+        locations = collections.defaultdict(list)
+        for path, manifest in manifests.items():
+            if not isinstance(manifest, dict):
+                continue
+            specs = manifest.get('import_specifications')
+            if not isinstance(specs, list):
+                continue
+            for fields in specs:
+                if isinstance(fields, dict):
+                    name = fields.get('import_name')
+                    if isinstance(name, str) and name:
+                        locations[name].append(path)
+
+        errors = []
+        for name, paths in locations.items():
+            if len(paths) < 2:
+                continue
+            for path in sorted(set(paths)):
+                others = sorted(set(p for p in paths if p != path))
+                parts = []
+                if paths.count(path) > 1:
+                    parts.append(
+                        f'used {paths.count(path)} times in this manifest')
+                if others:
+                    parts.append(f'also used in {", ".join(others)}')
+                errors.append(
+                    ManifestError(
+                        path, name,
+                        f'duplicate "import_name": {"; ".join(parts)}'))
+        return errors
+
+
+# Stateless helpers.
+
+
+def _resolve_checks(validator: ManifestValidator,
+                    checks: Tuple[Check, ...]) -> Dict[Scope, List[Check]]:
+    """Validates the check table and groups the enabled checks by scope.
+
+    Raises:
+        ValueError: A check id is duplicated, a check has no method, or a
+            disabled check has no reason.
+    """
+    ids = [check.id for check in checks]
+    duplicates = sorted(set(i for i in ids if ids.count(i) > 1))
+    if duplicates:
+        raise ValueError(f'Duplicate check ids: {", ".join(duplicates)}')
+    enabled = {scope: [] for scope in Scope}
+    for check in checks:
+        if not callable(getattr(validator, check.method_name, None)):
+            raise ValueError(f'Check "{check.id}" has no method '
+                             f'{check.method_name}()')
+        if not check.enabled and not check.reason:
+            raise ValueError(f'Disabled check "{check.id}" needs a reason')
+        if check.enabled:
+            enabled[check.scope].append(check)
+    return enabled
+
+
+def _spec_label(fields: Any, index: int) -> str:
+    """Returns the name used to identify an import specification in errors."""
+    if isinstance(fields, dict):
+        name = fields.get('import_name')
+        if isinstance(name, str) and name:
+            return name
+    return f'import_specifications[{index}]'
+
+
+def _script_entries(spec: ImportSpec) -> List[str]:
+    """Returns the string entries of the spec's scripts list."""
+    scripts = spec.fields.get('scripts')
+    if not isinstance(scripts, list):
+        return []
+    return [entry for entry in scripts if isinstance(entry, str)]
+
+
+def _is_empty(value: Any) -> bool:
+    return value is None or value == '' or value == [] or value == {}
+
+
+def _is_string_list(value: Any) -> bool:
+    return isinstance(value, list) and all(isinstance(v, str) for v in value)
+
+
+def _is_positive_number(value: Any) -> bool:
+    return (isinstance(value, (int, float)) and not isinstance(value, bool) and
+            value > 0)
+
+
+def _is_simple_import_config(script_path: str) -> bool:
+    """Returns True if the executor runs script_path as a simple import."""
+    return (_SIMPLE_IMPORT_DIR in script_path and
+            _SIMPLE_IMPORT_CONFIG_PREFIX in script_path)
+
+
+def _fits_some_machine(cpu: float, memory_gib: float) -> bool:
+    """Returns True if some machine type has at least this CPU and memory."""
+    return any(m['cpus'] >= cpu and m['memory_gib'] >= memory_gib
+               for m in _GCE_MACHINE_TYPES)
+
+
+def _matches_type(value: Any, expected_type: Any) -> bool:
+    """Returns True if value is a JSON value of the given Python type."""
+    if expected_type is bool:
+        return isinstance(value, bool)
+    if expected_type is int:
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected_type is float:
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if expected_type in (str, dict, list):
+        return isinstance(value, expected_type)
+    if typing.get_origin(expected_type) is list:
+        (item_type,) = typing.get_args(expected_type) or (Any,)
+        return isinstance(value, list) and all(
+            item_type is Any or _matches_type(item, item_type)
+            for item in value)
+    # Types not used by ExecutorConfig today are not checked.
+    return True
+
+
+def _type_name(expected_type: Any) -> str:
+    return getattr(expected_type, '__name__', str(expected_type))
+
+
+# Command line interface.
+
+EXIT_OK = 0
+EXIT_ERRORS = 1
+EXIT_USAGE = 2
+
+_DEFAULT_REPO_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), '..', '..', '..', '..'))
+
+
+def _plural(count: int, noun: str) -> str:
+    return f'{count} {noun}' if count == 1 else f'{count} {noun}s'
+
+
+def run(repo_dir: str,
+        manifest_paths: List[str],
+        validate_all: bool,
+        out: Optional[TextIO] = None,
+        err: Optional[TextIO] = None) -> int:
+    """Validates manifests and prints the results.
+
+    Args:
+        repo_dir: Path to the root of the data repository.
+        manifest_paths: Manifests to validate. Must be empty if validate_all
+            is set.
+        validate_all: Whether to validate all manifests in the repository.
+        out: Stream for results. Defaults to stdout.
+        err: Stream for usage errors. Defaults to stderr.
+
+    Returns:
+        The process exit code.
+    """
+    out = out or sys.stdout
+    err = err or sys.stderr
+    if validate_all == bool(manifest_paths):
+        print('Pass either one or more manifest paths or --all.', file=err)
+        return EXIT_USAGE
+
+    validator = ManifestValidator(repo_dir)
+    if validate_all:
+        errors = validator.validate()
+        num_checked = len(validator.find_manifests())
+    else:
+        errors = validator.validate(manifest_paths)
+        num_checked = len(set(os.path.abspath(p) for p in manifest_paths))
+
+    for error in errors:
+        print(error, file=out)
+    if errors:
+        num_failed = len(set(error.manifest_path for error in errors))
+        summary = (f'\n{_plural(len(errors), "error")} in {num_failed} of '
+                   f'{_plural(num_checked, "manifest")}.')
+    elif num_checked == 1:
+        summary = 'The manifest is valid.'
+    else:
+        summary = f'All {_plural(num_checked, "manifest")} are valid.'
+    disabled = ManifestValidator.disabled_checks()
+    if disabled:
+        summary += (' Disabled checks: ' +
+                    ', '.join(check.id for check in disabled) + '.')
+    print(summary, file=out)
+    return EXIT_ERRORS if errors else EXIT_OK
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """Parses command line arguments and validates manifests.
+
+    Args:
+        argv: Command line arguments, without the program name. Defaults to
+            sys.argv[1:].
+
+    Returns:
+        The process exit code.
+    """
+    parser = argparse.ArgumentParser(
+        description='Validates import manifest.json files.')
+    parser.add_argument('manifest_paths',
+                        nargs='*',
+                        help='Manifests to validate.')
+    parser.add_argument(
+        '--all',
+        action='store_true',
+        help='Validate all manifests under statvar_imports/ and scripts/.')
+    parser.add_argument('--repo_dir',
+                        default=_DEFAULT_REPO_DIR,
+                        help='Path to the root of the data repository.')
+    args = parser.parse_args(argv)
+    return run(args.repo_dir, args.manifest_paths, args.all)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
