@@ -59,53 +59,6 @@ from croniter import croniter
 
 from app import configs
 
-# Top-level folders (relative to the repository root) that contain manifests.
-MANIFEST_ROOTS = ('statvar_imports', 'scripts')
-# Maximum number of folders between a manifest root and a manifest.
-MAX_MANIFEST_DEPTH = 5
-MANIFEST_FILENAME = 'manifest.json'
-
-_ALLOWED_TOP_LEVEL_FIELDS = frozenset({'import_specifications'})
-
-# Fields of an import specification that are read by the import automation
-# code, plus '_comment' for human-readable notes.
-_ALLOWED_SPEC_FIELDS = frozenset({
-    '_comment',
-    'config_override',
-    'cron_schedule',
-    'curator_emails',
-    'data_download_url',
-    'image',
-    'import_inputs',
-    'import_name',
-    'provenance_description',
-    'provenance_url',
-    'resource_limits',
-    'scripts',
-    'source_files',
-    'user_script_timeout',
-    'validation_config_file',
-})
-
-_REQUIRED_SPEC_FIELDS = (
-    'import_name',
-    'curator_emails',
-    'provenance_url',
-    'provenance_description',
-    'scripts',
-    'import_inputs',
-)
-
-_STRING_FIELDS = ('import_name', 'provenance_url', 'provenance_description',
-                  'image')
-_STRING_LIST_FIELDS = ('scripts', 'source_files', 'data_download_url')
-
-_RESOURCE_NUMBER_FIELDS = ('cpu', 'memory', 'disk')
-_ALLOWED_RESOURCE_FIELDS = frozenset(_RESOURCE_NUMBER_FIELDS + ('machine',))
-
-_SCRIPT_EXTENSIONS = ('.py', '.sh')
-_SIMPLE_IMPORT_EXTENSION = '.json'
-
 # The constants below mirror rules applied by other executor modules. Keep them
 # in sync; manifest_validator_test.py fails if they differ.
 
@@ -113,8 +66,6 @@ _SIMPLE_IMPORT_EXTENSION = '.json'
 # (import_target.py).
 _IMPORT_NAME_CHARS = 'A-Za-z0-9-_'
 _IMPORT_DIR_CHARS = 'A-Za-z0-9-_/'
-_IMPORT_NAME_REGEX = re.compile(f'[{_IMPORT_NAME_CHARS}]+')
-_IMPORT_DIR_REGEX = re.compile(f'[{_IMPORT_DIR_CHARS}]+')
 
 # A .json script is run as a simple import if its path contains both of these
 # strings (cloud_run_simple_import.py).
@@ -299,12 +250,6 @@ class ImportSpec:
     fields: Dict[str, Any]
 
 
-# Ids of the checks that always run, because no other check can run without
-# them. They are not listed in ManifestValidator.CHECKS.
-VALID_JSON_CHECK = 'valid-json'
-MANIFEST_STRUCTURE_CHECK = 'manifest-structure'
-
-
 class ManifestValidator:
     """Validates the manifests of a data repository.
 
@@ -382,32 +327,37 @@ class ManifestValidator:
         return [check for check in cls.CHECKS if not check.enabled]
 
     def find_manifests(self) -> List[str]:
-        """Returns the manifests under MANIFEST_ROOTS.
+        """Returns the manifests under statvar_imports/ and scripts/.
 
-        Searches at most MAX_MANIFEST_DEPTH folders below each root, skips
+        Searches at most max_depth folders below each of these folders, skips
         hidden folders (such as .env) and does not follow symbolic links.
 
         Returns:
             Sorted list of manifest paths relative to the repository root,
             using '/' as the separator.
         """
+        # Top-level folders (relative to the repository root) to search.
+        roots = ('statvar_imports', 'scripts')
+        # Maximum number of folders between a root and a manifest.
+        max_depth = 5
+        filename = 'manifest.json'
+
         manifests = []
-        for root in MANIFEST_ROOTS:
+        for root in roots:
             root_dir = os.path.join(self._repo_dir, root)
             for dir_path, dir_names, file_names in os.walk(root_dir):
                 rel_dir = os.path.relpath(dir_path, root_dir)
                 depth = 0 if rel_dir == os.curdir else len(rel_dir.split(
                     os.sep))
-                if depth >= MAX_MANIFEST_DEPTH:
+                if depth >= max_depth:
                     dir_names[:] = []
                 else:
                     dir_names[:] = [
                         d for d in dir_names if not d.startswith('.')
                     ]
-                if MANIFEST_FILENAME in file_names:
+                if filename in file_names:
                     manifests.append(
-                        self._to_repo_path(
-                            os.path.join(dir_path, MANIFEST_FILENAME)))
+                        self._to_repo_path(os.path.join(dir_path, filename)))
         return sorted(manifests)
 
     def validate(
@@ -500,7 +450,7 @@ class ManifestValidator:
         """Reads and parses a manifest (the 'valid-json' check)."""
 
         def error(message: str) -> ManifestError:
-            return ManifestError(manifest_path, None, message, VALID_JSON_CHECK)
+            return ManifestError(manifest_path, None, message, 'valid-json')
 
         try:
             with open(os.path.join(self._repo_dir, manifest_path),
@@ -524,7 +474,7 @@ class ManifestValidator:
         def structure_error(message: str,
                             label: Optional[str] = None) -> ManifestError:
             return ManifestError(manifest_path, label, message,
-                                 MANIFEST_STRUCTURE_CHECK)
+                                 'manifest-structure')
 
         if not isinstance(manifest, dict):
             errors.append(structure_error('manifest must be a JSON object'))
@@ -568,7 +518,7 @@ class ManifestValidator:
                                  manifest: Any) -> List[str]:
         del manifest  # Unused.
         import_dir = os.path.dirname(manifest_path)
-        if not _IMPORT_DIR_REGEX.fullmatch(import_dir):
+        if not re.fullmatch(f'[{_IMPORT_DIR_CHARS}]+', import_dir):
             return [
                 f'folder path "{import_dir}" may only contain letters, '
                 'digits, "_", "-" and "/"'
@@ -580,24 +530,46 @@ class ManifestValidator:
         del manifest_path  # Unused.
         if not isinstance(manifest, dict):
             return []
+        allowed_fields = {'import_specifications'}
         return [
             f'unknown top-level field "{field}"; only '
             '"import_specifications" is allowed at the top level'
-            for field in sorted(set(manifest) - _ALLOWED_TOP_LEVEL_FIELDS)
+            for field in sorted(set(manifest) - allowed_fields)
         ]
 
     # Import checks: (ImportSpec) -> error messages.
 
     def _check_unknown_fields(self, spec: ImportSpec) -> List[str]:
+        # Fields that the import automation code reads, plus '_comment' for
+        # human-readable notes.
+        allowed_fields = {
+            '_comment',
+            'config_override',
+            'cron_schedule',
+            'curator_emails',
+            'data_download_url',
+            'image',
+            'import_inputs',
+            'import_name',
+            'provenance_description',
+            'provenance_url',
+            'resource_limits',
+            'scripts',
+            'source_files',
+            'user_script_timeout',
+            'validation_config_file',
+        }
         return [
             f'unknown field "{field}"'
-            for field in sorted(set(spec.fields) - _ALLOWED_SPEC_FIELDS)
+            for field in sorted(set(spec.fields) - allowed_fields)
         ]
 
     def _check_required_fields(self, spec: ImportSpec) -> List[str]:
+        required_fields = ('import_name', 'curator_emails', 'provenance_url',
+                           'provenance_description', 'scripts', 'import_inputs')
         return [
             f'required field "{field}" is missing or empty'
-            for field in _REQUIRED_SPEC_FIELDS
+            for field in required_fields
             if _is_empty(spec.fields.get(field))
         ]
 
@@ -608,12 +580,15 @@ class ManifestValidator:
         return []
 
     def _check_field_types(self, spec: ImportSpec) -> List[str]:
+        string_fields = ('import_name', 'provenance_url',
+                         'provenance_description', 'image')
+        string_list_fields = ('scripts', 'source_files', 'data_download_url')
         fields = spec.fields
         messages = []
-        for field in _STRING_FIELDS:
+        for field in string_fields:
             if field in fields and not isinstance(fields[field], str):
                 messages.append(f'"{field}" must be a string')
-        for field in _STRING_LIST_FIELDS:
+        for field in string_list_fields:
             if field in fields and not _is_string_list(fields[field]):
                 messages.append(f'"{field}" must be a list of strings')
         if 'user_script_timeout' in fields and not _is_positive_number(
@@ -625,7 +600,7 @@ class ManifestValidator:
         name = spec.fields.get('import_name')
         if not isinstance(name, str) or not name:
             return []
-        if not _IMPORT_NAME_REGEX.fullmatch(name):
+        if not re.fullmatch(f'[{_IMPORT_NAME_CHARS}]+', name):
             return [
                 f'"import_name" "{name}" may only contain letters, digits, '
                 '"_" and "-"'
@@ -645,6 +620,8 @@ class ManifestValidator:
         return messages
 
     def _check_script_type(self, spec: ImportSpec) -> List[str]:
+        script_extensions = ('.py', '.sh')
+        simple_import_extension = '.json'
         messages = []
         for entry in _script_entries(spec):
             if not entry.strip():
@@ -652,9 +629,9 @@ class ManifestValidator:
             # The executor picks the interpreter from the first space-separated
             # word of the entry.
             script = entry.split(' ')[0]
-            if script.endswith(_SCRIPT_EXTENSIONS):
+            if script.endswith(script_extensions):
                 continue
-            if script.endswith(_SIMPLE_IMPORT_EXTENSION) and (
+            if script.endswith(simple_import_extension) and (
                     _is_simple_import_config(
                         os.path.join(spec.abs_import_dir, script))):
                 continue
@@ -680,11 +657,13 @@ class ManifestValidator:
         limits = spec.fields['resource_limits']
         if not isinstance(limits, dict):
             return ['"resource_limits" must be an object']
+        number_fields = ('cpu', 'memory', 'disk')
+        allowed_fields = set(number_fields) | {'machine'}
         messages = [
             f'unknown field "resource_limits.{field}"'
-            for field in sorted(set(limits) - _ALLOWED_RESOURCE_FIELDS)
+            for field in sorted(set(limits) - allowed_fields)
         ]
-        for field in _RESOURCE_NUMBER_FIELDS:
+        for field in number_fields:
             if field in limits and not _is_positive_number(limits[field]):
                 messages.append(f'"resource_limits.{field}" must be a positive '
                                 'number')
@@ -895,9 +874,6 @@ EXIT_OK = 0
 EXIT_ERRORS = 1
 EXIT_USAGE = 2
 
-_DEFAULT_REPO_DIR = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), '..', '..', '..', '..'))
-
 
 def _plural(count: int, noun: str) -> str:
     return f'{count} {noun}' if count == 1 else f'{count} {noun}s'
@@ -973,7 +949,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         action='store_true',
         help='Validate all manifests under statvar_imports/ and scripts/.')
     parser.add_argument('--repo_dir',
-                        default=_DEFAULT_REPO_DIR,
+                        default=os.path.abspath(
+                            os.path.join(os.path.dirname(__file__), '..', '..',
+                                         '..', '..')),
                         help='Path to the root of the data repository.')
     args = parser.parse_args(argv)
     return run(args.repo_dir, args.manifest_paths, args.all)

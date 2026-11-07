@@ -473,7 +473,7 @@ class FindManifestsTest(ManifestValidatorTestBase):
                 ])
 
     def test_respects_maximum_depth(self):
-        # MAX_MANIFEST_DEPTH is 5 folders below the root folder.
+        # find_manifests() searches at most 5 folders below the root folder.
         at_limit = 'scripts/1/2/3/4/5/manifest.json'
         too_deep = 'scripts/1/2/3/4/5/6/manifest.json'
         self.write_spec(path=at_limit)
