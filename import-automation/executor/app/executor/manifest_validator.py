@@ -18,26 +18,14 @@ wrong value types), invalid settings (cron schedules, resource limits,
 executor config overrides), missing validation config files and duplicate
 import names across the repository.
 
-The module is self-contained: the only executor code it uses is
-configs.ExecutorConfig, which defines the settings that config_override may
-change. A few rules that the executor also applies (allowed name characters,
-simple import detection and machine types) are defined here as constants;
-manifest_validator_test.py checks that they still match the executor.
-
-The module has two main classes:
-  - ManifestChecks: the core rules. Each method implements one check on data
-    it is given; it does not find or read manifest files.
-  - ManifestValidator: finds and reads manifests, runs the enabled checks and
-    collects the errors.
-
 The validator can be used programmatically, or from the command line (from
 the repository root):
 
-  # Validate specific manifests, e.g. while editing them:
+  # Validate specific manifest file(s):
   python import-automation/executor/app/executor/manifest_validator.py \\
       statvar_imports/who/adolescent_birth_rate/manifest.json
 
-  # Validate all manifests under statvar_imports/ and scripts/:
+  # Validate all manifest files under statvar_imports/ and scripts/:
   python import-automation/executor/app/executor/manifest_validator.py --all
 
 Exit codes: 0 if all manifests are valid, 1 if errors were found, 2 for
@@ -168,9 +156,6 @@ class ManifestChecks:
     """The core manifest validation rules.
 
     Each public method implements one check and returns the problems it finds.
-    The class does not find, read or walk manifest files; ManifestValidator
-    does that and decides which checks to run. The only outside information
-    the checks use is passed to the constructor, so tests can replace it.
     """
 
     def __init__(self,
@@ -523,12 +508,6 @@ class ManifestValidator:
             print(error)
     """
 
-    # The checks the validator runs, grouped by what they look at. Within a
-    # group, checks run in the order listed. Two checks always run first and
-    # cannot be disabled: 'valid-json' (the file is valid JSON) and
-    # 'manifest-structure' (it is an object with a non-empty
-    # "import_specifications" list of objects).
-    #
     # To turn a check off temporarily, set enabled=False and give a reason,
     # e.g. reason='b/123456: too noisy until the cleanup lands'.
 
