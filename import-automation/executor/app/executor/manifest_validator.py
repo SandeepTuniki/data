@@ -24,8 +24,14 @@ change. A few rules that the executor also applies (allowed name characters,
 simple import detection and machine types) are defined here as constants;
 manifest_validator_test.py checks that they still match the executor.
 
-The checks can be used programmatically through ManifestValidator, or from the
-command line (from the repository root):
+The module has two main classes:
+  - ManifestChecks: the core rules. Each method implements one check on data
+    it is given; it does not find or read manifest files.
+  - ManifestValidator: finds and reads manifests, runs the enabled checks and
+    collects the errors.
+
+The validator can be used programmatically, or from the command line (from
+the repository root):
 
   # Validate specific manifests, e.g. while editing them:
   python import-automation/executor/app/executor/manifest_validator.py \\
@@ -47,7 +53,7 @@ import re
 import shlex
 import sys
 import typing
-from typing import Any, Dict, List, Optional, TextIO, Tuple
+from typing import Any, Callable, Dict, List, Optional, TextIO, Tuple
 
 if __name__ == '__main__':
     # When run as a script, make the executor's 'app' package importable.
@@ -101,21 +107,17 @@ class Check:
     """A validation check run by ManifestValidator.
 
     Attributes:
-        id: Stable identifier, shown in error messages. The check is
-            implemented by the ManifestValidator method named
-            '_check_<id with "-" replaced by "_">'.
+        id: Stable identifier, shown in error messages.
+        method: The ManifestChecks method that implements the check.
         description: What the check verifies.
         enabled: Whether the check runs.
         reason: Why the check is disabled. Required if enabled is False.
     """
     id: str
+    method: Callable[..., Any]
     description: str
     enabled: bool = True
     reason: str = ''
-
-    @property
-    def method_name(self) -> str:
-        return '_check_' + self.id.replace('-', '_')
 
 
 @dataclasses.dataclass(frozen=True, order=True)
@@ -162,6 +164,294 @@ class ImportSpec:
     fields: Dict[str, Any]
 
 
+class ManifestChecks:
+    """The core manifest validation rules.
+
+    Each public method implements one check and returns the problems it finds.
+    The class does not find, read or walk manifest files; ManifestValidator
+    does that and decides which checks to run. The only outside information
+    the checks use is passed to the constructor, so tests can replace it.
+    """
+
+    def __init__(self,
+                 executor_setting_types: Optional[Dict[str, Any]] = None,
+                 file_exists: Callable[[str], bool] = os.path.isfile):
+        """Initializes the checks.
+
+        Args:
+            executor_setting_types: Settings that config_override may change,
+                mapped to their types. Defaults to the fields of
+                configs.ExecutorConfig.
+            file_exists: Returns whether a file exists at the given path. Used
+                by the validation-config-file check.
+        """
+        if executor_setting_types is None:
+            executor_setting_types = _executor_config_setting_types()
+        self._executor_setting_types = executor_setting_types
+        self._file_exists = file_exists
+
+    # Manifest checks: (manifest_path, manifest) -> error messages.
+
+    def folder_path_chars(self, manifest_path: str, manifest: Any) -> List[str]:
+        del manifest  # Unused.
+        import_dir = os.path.dirname(manifest_path)
+        if not re.fullmatch(f'[{_IMPORT_DIR_CHARS}]+', import_dir):
+            return [
+                f'folder path "{import_dir}" may only contain letters, '
+                'digits, "_", "-" and "/"'
+            ]
+        return []
+
+    def top_level_fields(self, manifest_path: str, manifest: Any) -> List[str]:
+        del manifest_path  # Unused.
+        if not isinstance(manifest, dict):
+            return []
+        allowed_fields = {'import_specifications'}
+        return [
+            f'unknown top-level field "{field}"; only '
+            '"import_specifications" is allowed at the top level'
+            for field in sorted(set(manifest) - allowed_fields)
+        ]
+
+    # Import checks: (ImportSpec) -> error messages.
+
+    def unknown_fields(self, spec: ImportSpec) -> List[str]:
+        # Fields that the import automation code reads, plus '_comment' for
+        # human-readable notes.
+        allowed_fields = {
+            '_comment',
+            'config_override',
+            'cron_schedule',
+            'curator_emails',
+            'data_download_url',
+            'image',
+            'import_inputs',
+            'import_name',
+            'provenance_description',
+            'provenance_url',
+            'resource_limits',
+            'scripts',
+            'source_files',
+            'user_script_timeout',
+            'validation_config_file',
+        }
+        return [
+            f'unknown field "{field}"'
+            for field in sorted(set(spec.fields) - allowed_fields)
+        ]
+
+    def required_fields(self, spec: ImportSpec) -> List[str]:
+        required_fields = ('import_name', 'curator_emails', 'provenance_url',
+                           'provenance_description', 'scripts', 'import_inputs')
+        return [
+            f'required field "{field}" is missing or empty'
+            for field in required_fields
+            if _is_empty(spec.fields.get(field))
+        ]
+
+    def curator_emails_type(self, spec: ImportSpec) -> List[str]:
+        if 'curator_emails' in spec.fields and not _is_string_list(
+                spec.fields['curator_emails']):
+            return ['"curator_emails" must be a list of strings']
+        return []
+
+    def field_types(self, spec: ImportSpec) -> List[str]:
+        string_fields = ('import_name', 'provenance_url',
+                         'provenance_description', 'image')
+        string_list_fields = ('scripts', 'source_files', 'data_download_url')
+        fields = spec.fields
+        messages = []
+        for field in string_fields:
+            if field in fields and not isinstance(fields[field], str):
+                messages.append(f'"{field}" must be a string')
+        for field in string_list_fields:
+            if field in fields and not _is_string_list(fields[field]):
+                messages.append(f'"{field}" must be a list of strings')
+        if 'user_script_timeout' in fields and not _is_positive_number(
+                fields['user_script_timeout']):
+            messages.append('"user_script_timeout" must be a positive number')
+        return messages
+
+    def import_name_chars(self, spec: ImportSpec) -> List[str]:
+        name = spec.fields.get('import_name')
+        if not isinstance(name, str) or not name:
+            return []
+        if not re.fullmatch(f'[{_IMPORT_NAME_CHARS}]+', name):
+            return [
+                f'"import_name" "{name}" may only contain letters, digits, '
+                '"_" and "-"'
+            ]
+        return []
+
+    def script_syntax(self, spec: ImportSpec) -> List[str]:
+        messages = []
+        for entry in _script_entries(spec):
+            if not entry.strip():
+                messages.append('script entry is empty')
+                continue
+            try:
+                shlex.split(entry)
+            except ValueError as e:
+                messages.append(f'cannot parse script entry "{entry}": {e}')
+        return messages
+
+    def script_type(self, spec: ImportSpec) -> List[str]:
+        script_extensions = ('.py', '.sh')
+        simple_import_extension = '.json'
+        messages = []
+        for entry in _script_entries(spec):
+            if not entry.strip():
+                continue
+            # The executor picks the interpreter from the first space-separated
+            # word of the entry.
+            script = entry.split(' ')[0]
+            if script.endswith(script_extensions):
+                continue
+            if script.endswith(simple_import_extension) and (
+                    _is_simple_import_config(
+                        os.path.join(spec.abs_import_dir, script))):
+                continue
+            messages.append(
+                f'script "{script}" must end in .py or .sh (or be a simple '
+                'import config)')
+        return messages
+
+    def cron_schedule(self, spec: ImportSpec) -> List[str]:
+        if 'cron_schedule' not in spec.fields:
+            return []
+        schedule = spec.fields['cron_schedule']
+        if not isinstance(schedule, str) or not croniter.is_valid(schedule):
+            return [
+                f'"cron_schedule" {json.dumps(schedule)} is not a valid cron '
+                'expression'
+            ]
+        return []
+
+    def resource_limits_types(self, spec: ImportSpec) -> List[str]:
+        if 'resource_limits' not in spec.fields:
+            return []
+        limits = spec.fields['resource_limits']
+        if not isinstance(limits, dict):
+            return ['"resource_limits" must be an object']
+        number_fields = ('cpu', 'memory', 'disk')
+        allowed_fields = set(number_fields) | {'machine'}
+        messages = [
+            f'unknown field "resource_limits.{field}"'
+            for field in sorted(set(limits) - allowed_fields)
+        ]
+        for field in number_fields:
+            if field in limits and not _is_positive_number(limits[field]):
+                messages.append(f'"resource_limits.{field}" must be a positive '
+                                'number')
+        if 'machine' in limits and not isinstance(limits['machine'], str):
+            messages.append('"resource_limits.machine" must be a string')
+        return messages
+
+    def resource_limits_size(self, spec: ImportSpec) -> List[str]:
+        limits = spec.fields.get('resource_limits')
+        if not isinstance(limits, dict):
+            return []
+        # Missing cpu or memory are filled in with defaults by the executor, so
+        # only the values that are set need to fit on a machine type.
+        requested = {
+            field: limits[field]
+            for field in ('cpu', 'memory')
+            if field in limits
+        }
+        if not requested or not all(
+                _is_positive_number(v) for v in requested.values()):
+            return []
+        if _fits_some_machine(requested.get('cpu', 0),
+                              requested.get('memory', 0)):
+            return []
+        described = ' and '.join(
+            f'{field}={value}' for field, value in requested.items())
+        return [
+            f'"resource_limits" ({described}) is larger than the largest '
+            'available machine type'
+        ]
+
+    def config_override(self, spec: ImportSpec) -> List[str]:
+        if 'config_override' not in spec.fields:
+            return []
+        override = spec.fields['config_override']
+        if not isinstance(override, dict):
+            return ['"config_override" must be an object']
+        messages = []
+        for key in sorted(override):
+            expected_type = self._executor_setting_types.get(key)
+            if expected_type is None:
+                messages.append(f'"config_override.{key}" is not an executor '
+                                'setting')
+            elif not _matches_type(override[key], expected_type):
+                messages.append(f'"config_override.{key}" must be of type '
+                                f'{_type_name(expected_type)}')
+        return messages
+
+    def validation_config_file(self, spec: ImportSpec) -> List[str]:
+        if 'validation_config_file' not in spec.fields:
+            return []
+        path = spec.fields['validation_config_file']
+        if not isinstance(path, str):
+            return ['"validation_config_file" must be a string']
+        if not self._file_exists(os.path.join(spec.abs_import_dir, path)):
+            return [f'"validation_config_file" "{path}" does not exist']
+        return []
+
+    def import_inputs(self, spec: ImportSpec) -> List[str]:
+        if 'import_inputs' not in spec.fields:
+            return []
+        inputs = spec.fields['import_inputs']
+        if not isinstance(inputs, list):
+            return ['"import_inputs" must be a list']
+        messages = []
+        for index, item in enumerate(inputs):
+            if not isinstance(item, dict):
+                messages.append(f'"import_inputs[{index}]" must be an object')
+                continue
+            for key in sorted(item):
+                value = item[key]
+                if not isinstance(value, str) and not _is_string_list(value):
+                    messages.append(f'"import_inputs[{index}].{key}" must be '
+                                    'a string or a list of strings')
+        return messages
+
+    # Repository checks: (manifests by path) -> ManifestErrors.
+
+    def unique_import_names(self, manifests: Dict[str,
+                                                  Any]) -> List[ManifestError]:
+        locations = collections.defaultdict(list)
+        for path, manifest in manifests.items():
+            if not isinstance(manifest, dict):
+                continue
+            specs = manifest.get('import_specifications')
+            if not isinstance(specs, list):
+                continue
+            for fields in specs:
+                if isinstance(fields, dict):
+                    name = fields.get('import_name')
+                    if isinstance(name, str) and name:
+                        locations[name].append(path)
+
+        errors = []
+        for name, paths in locations.items():
+            if len(paths) < 2:
+                continue
+            for path in sorted(set(paths)):
+                others = sorted(set(p for p in paths if p != path))
+                parts = []
+                if paths.count(path) > 1:
+                    parts.append(
+                        f'used {paths.count(path)} times in this manifest')
+                if others:
+                    parts.append(f'also used in {", ".join(others)}')
+                errors.append(
+                    ManifestError(
+                        path, name,
+                        f'duplicate "import_name": {"; ".join(parts)}'))
+        return errors
+
+
 class ManifestValidator:
     """Validates the manifests of a data repository.
 
@@ -179,80 +469,73 @@ class ManifestValidator:
     #
     # To turn a check off temporarily, set enabled=False and give a reason,
     # e.g. reason='b/123456: too noisy until the cleanup lands'.
-    #
-    # Each check is implemented by the method _check_<id>, with "-" in the id
-    # replaced by "_".
 
     # yapf: disable
     # Checks on a manifest file as a whole, run once per manifest.
-    # Method signature: (manifest_path, manifest) -> error messages.
+    # Method arguments: (manifest_path, manifest). Returns error messages.
     MANIFEST_CHECKS = (
-        Check('folder-path-chars',
+        Check('folder-path-chars', ManifestChecks.folder_path_chars,
               'Folder path only uses letters, digits, "_", "-" and "/".'),
-        Check('top-level-fields',
+        Check('top-level-fields', ManifestChecks.top_level_fields,
               'Only "import_specifications" is allowed at the top level.'),
     )
 
     # Checks on one import specification, run once per import.
-    # Method signature: (ImportSpec) -> error messages.
+    # Method arguments: (ImportSpec). Returns error messages.
     IMPORT_CHECKS = (
-        Check('unknown-fields',
+        Check('unknown-fields', ManifestChecks.unknown_fields,
               'Imports only have known fields (plus "_comment").'),
-        Check('required-fields',
+        Check('required-fields', ManifestChecks.required_fields,
               'Required fields are present and not empty.'),
-        Check('curator-emails-type',
+        Check('curator-emails-type', ManifestChecks.curator_emails_type,
               'curator_emails is a list of strings.'),
-        Check('field-types',
+        Check('field-types', ManifestChecks.field_types,
               'Other fields have the right basic types.'),
-        Check('import-name-chars',
+        Check('import-name-chars', ManifestChecks.import_name_chars,
               'import_name only uses letters, digits, "_" and "-".'),
-        Check('script-syntax',
+        Check('script-syntax', ManifestChecks.script_syntax,
               'Script entries are non-empty and can be split into words.'),
-        Check('script-type',
+        Check('script-type', ManifestChecks.script_type,
               'Scripts end in .py or .sh, or are simple import configs.'),
-        Check('cron-schedule',
+        Check('cron-schedule', ManifestChecks.cron_schedule,
               'cron_schedule, if set, is accepted by croniter.'),
-        Check('resource-limits-types',
+        Check('resource-limits-types', ManifestChecks.resource_limits_types,
               'resource_limits has known fields with valid types.'),
-        Check('resource-limits-size',
+        Check('resource-limits-size', ManifestChecks.resource_limits_size,
               'resource_limits cpu and memory fit on a machine type.'),
-        Check('config-override',
+        Check('config-override', ManifestChecks.config_override,
               'config_override sets real executor settings, valid types.'),
-        Check('validation-config-file',
+        Check('validation-config-file', ManifestChecks.validation_config_file,
               'validation_config_file, if set, exists.'),
-        Check('import-inputs',
+        Check('import-inputs', ManifestChecks.import_inputs,
               'import_inputs values are strings or lists of strings.'),
     )
 
     # Checks across all manifests, run once after all manifests are read.
-    # Method signature: (manifests by path) -> ManifestErrors.
+    # Method arguments: (manifests by path). Returns ManifestErrors.
     REPO_CHECKS = (
-        Check('unique-import-names',
+        Check('unique-import-names', ManifestChecks.unique_import_names,
               'import_name is unique across all manifests.'),
     )
     # yapf: enable
 
-    def __init__(self, repo_dir: str):
+    def __init__(self, repo_dir: str, checks: Optional[ManifestChecks] = None):
         """Initializes the validator.
 
         Args:
             repo_dir: Path to the root of the data repository.
+            checks: The checks to run. Defaults to ManifestChecks().
 
         Raises:
-            ValueError: The check lists are inconsistent, e.g. a check has no
-                method.
+            ValueError: The check lists are inconsistent, e.g. a check id is
+                duplicated.
         """
         self._repo_dir = os.path.abspath(repo_dir)
-        _validate_check_lists(self)
+        _validate_check_lists(self.all_checks())
         self._manifest_checks = _enabled(self.MANIFEST_CHECKS)
         self._import_checks = _enabled(self.IMPORT_CHECKS)
         self._repo_checks = _enabled(self.REPO_CHECKS)
-        # Settings that config_override may change, with their types.
-        type_hints = typing.get_type_hints(configs.ExecutorConfig)
-        self._executor_setting_types = {
-            field.name: type_hints[field.name]
-            for field in dataclasses.fields(configs.ExecutorConfig)
-        }
+        self._checks = checks or ManifestChecks()
 
     # Public methods.
 
@@ -407,9 +690,8 @@ class ManifestValidator:
         errors = []
         for check in self._manifest_checks:
             errors.extend(
-                ManifestError(manifest_path, None, message, check.id)
-                for message in getattr(self, check.method_name)(manifest_path,
-                                                                manifest))
+                ManifestError(manifest_path, None, message, check.id) for
+                message in check.method(self._checks, manifest_path, manifest))
 
         def structure_error(message: str,
                             label: Optional[str] = None) -> ManifestError:
@@ -439,7 +721,7 @@ class ManifestValidator:
             for check in self._import_checks:
                 errors.extend(
                     ManifestError(manifest_path, label, message, check.id)
-                    for message in getattr(self, check.method_name)(spec))
+                    for message in check.method(self._checks, spec))
         return errors
 
     def _run_repo_checks(self, manifests: Dict[str,
@@ -449,294 +731,36 @@ class ManifestValidator:
         for check in self._repo_checks:
             errors.extend(
                 dataclasses.replace(error, check=check.id)
-                for error in getattr(self, check.method_name)(manifests))
-        return errors
-
-    # Manifest checks: (manifest_path, manifest) -> error messages.
-
-    def _check_folder_path_chars(self, manifest_path: str,
-                                 manifest: Any) -> List[str]:
-        del manifest  # Unused.
-        import_dir = os.path.dirname(manifest_path)
-        if not re.fullmatch(f'[{_IMPORT_DIR_CHARS}]+', import_dir):
-            return [
-                f'folder path "{import_dir}" may only contain letters, '
-                'digits, "_", "-" and "/"'
-            ]
-        return []
-
-    def _check_top_level_fields(self, manifest_path: str,
-                                manifest: Any) -> List[str]:
-        del manifest_path  # Unused.
-        if not isinstance(manifest, dict):
-            return []
-        allowed_fields = {'import_specifications'}
-        return [
-            f'unknown top-level field "{field}"; only '
-            '"import_specifications" is allowed at the top level'
-            for field in sorted(set(manifest) - allowed_fields)
-        ]
-
-    # Import checks: (ImportSpec) -> error messages.
-
-    def _check_unknown_fields(self, spec: ImportSpec) -> List[str]:
-        # Fields that the import automation code reads, plus '_comment' for
-        # human-readable notes.
-        allowed_fields = {
-            '_comment',
-            'config_override',
-            'cron_schedule',
-            'curator_emails',
-            'data_download_url',
-            'image',
-            'import_inputs',
-            'import_name',
-            'provenance_description',
-            'provenance_url',
-            'resource_limits',
-            'scripts',
-            'source_files',
-            'user_script_timeout',
-            'validation_config_file',
-        }
-        return [
-            f'unknown field "{field}"'
-            for field in sorted(set(spec.fields) - allowed_fields)
-        ]
-
-    def _check_required_fields(self, spec: ImportSpec) -> List[str]:
-        required_fields = ('import_name', 'curator_emails', 'provenance_url',
-                           'provenance_description', 'scripts', 'import_inputs')
-        return [
-            f'required field "{field}" is missing or empty'
-            for field in required_fields
-            if _is_empty(spec.fields.get(field))
-        ]
-
-    def _check_curator_emails_type(self, spec: ImportSpec) -> List[str]:
-        if 'curator_emails' in spec.fields and not _is_string_list(
-                spec.fields['curator_emails']):
-            return ['"curator_emails" must be a list of strings']
-        return []
-
-    def _check_field_types(self, spec: ImportSpec) -> List[str]:
-        string_fields = ('import_name', 'provenance_url',
-                         'provenance_description', 'image')
-        string_list_fields = ('scripts', 'source_files', 'data_download_url')
-        fields = spec.fields
-        messages = []
-        for field in string_fields:
-            if field in fields and not isinstance(fields[field], str):
-                messages.append(f'"{field}" must be a string')
-        for field in string_list_fields:
-            if field in fields and not _is_string_list(fields[field]):
-                messages.append(f'"{field}" must be a list of strings')
-        if 'user_script_timeout' in fields and not _is_positive_number(
-                fields['user_script_timeout']):
-            messages.append('"user_script_timeout" must be a positive number')
-        return messages
-
-    def _check_import_name_chars(self, spec: ImportSpec) -> List[str]:
-        name = spec.fields.get('import_name')
-        if not isinstance(name, str) or not name:
-            return []
-        if not re.fullmatch(f'[{_IMPORT_NAME_CHARS}]+', name):
-            return [
-                f'"import_name" "{name}" may only contain letters, digits, '
-                '"_" and "-"'
-            ]
-        return []
-
-    def _check_script_syntax(self, spec: ImportSpec) -> List[str]:
-        messages = []
-        for entry in _script_entries(spec):
-            if not entry.strip():
-                messages.append('script entry is empty')
-                continue
-            try:
-                shlex.split(entry)
-            except ValueError as e:
-                messages.append(f'cannot parse script entry "{entry}": {e}')
-        return messages
-
-    def _check_script_type(self, spec: ImportSpec) -> List[str]:
-        script_extensions = ('.py', '.sh')
-        simple_import_extension = '.json'
-        messages = []
-        for entry in _script_entries(spec):
-            if not entry.strip():
-                continue
-            # The executor picks the interpreter from the first space-separated
-            # word of the entry.
-            script = entry.split(' ')[0]
-            if script.endswith(script_extensions):
-                continue
-            if script.endswith(simple_import_extension) and (
-                    _is_simple_import_config(
-                        os.path.join(spec.abs_import_dir, script))):
-                continue
-            messages.append(
-                f'script "{script}" must end in .py or .sh (or be a simple '
-                'import config)')
-        return messages
-
-    def _check_cron_schedule(self, spec: ImportSpec) -> List[str]:
-        if 'cron_schedule' not in spec.fields:
-            return []
-        schedule = spec.fields['cron_schedule']
-        if not isinstance(schedule, str) or not croniter.is_valid(schedule):
-            return [
-                f'"cron_schedule" {json.dumps(schedule)} is not a valid cron '
-                'expression'
-            ]
-        return []
-
-    def _check_resource_limits_types(self, spec: ImportSpec) -> List[str]:
-        if 'resource_limits' not in spec.fields:
-            return []
-        limits = spec.fields['resource_limits']
-        if not isinstance(limits, dict):
-            return ['"resource_limits" must be an object']
-        number_fields = ('cpu', 'memory', 'disk')
-        allowed_fields = set(number_fields) | {'machine'}
-        messages = [
-            f'unknown field "resource_limits.{field}"'
-            for field in sorted(set(limits) - allowed_fields)
-        ]
-        for field in number_fields:
-            if field in limits and not _is_positive_number(limits[field]):
-                messages.append(f'"resource_limits.{field}" must be a positive '
-                                'number')
-        if 'machine' in limits and not isinstance(limits['machine'], str):
-            messages.append('"resource_limits.machine" must be a string')
-        return messages
-
-    def _check_resource_limits_size(self, spec: ImportSpec) -> List[str]:
-        limits = spec.fields.get('resource_limits')
-        if not isinstance(limits, dict):
-            return []
-        # Missing cpu or memory are filled in with defaults by the executor, so
-        # only the values that are set need to fit on a machine type.
-        requested = {
-            field: limits[field]
-            for field in ('cpu', 'memory')
-            if field in limits
-        }
-        if not requested or not all(
-                _is_positive_number(v) for v in requested.values()):
-            return []
-        if _fits_some_machine(requested.get('cpu', 0),
-                              requested.get('memory', 0)):
-            return []
-        described = ' and '.join(
-            f'{field}={value}' for field, value in requested.items())
-        return [
-            f'"resource_limits" ({described}) is larger than the largest '
-            'available machine type'
-        ]
-
-    def _check_config_override(self, spec: ImportSpec) -> List[str]:
-        if 'config_override' not in spec.fields:
-            return []
-        override = spec.fields['config_override']
-        if not isinstance(override, dict):
-            return ['"config_override" must be an object']
-        messages = []
-        for key in sorted(override):
-            expected_type = self._executor_setting_types.get(key)
-            if expected_type is None:
-                messages.append(f'"config_override.{key}" is not an executor '
-                                'setting')
-            elif not _matches_type(override[key], expected_type):
-                messages.append(f'"config_override.{key}" must be of type '
-                                f'{_type_name(expected_type)}')
-        return messages
-
-    def _check_validation_config_file(self, spec: ImportSpec) -> List[str]:
-        if 'validation_config_file' not in spec.fields:
-            return []
-        path = spec.fields['validation_config_file']
-        if not isinstance(path, str):
-            return ['"validation_config_file" must be a string']
-        if not os.path.isfile(os.path.join(spec.abs_import_dir, path)):
-            return [f'"validation_config_file" "{path}" does not exist']
-        return []
-
-    def _check_import_inputs(self, spec: ImportSpec) -> List[str]:
-        if 'import_inputs' not in spec.fields:
-            return []
-        inputs = spec.fields['import_inputs']
-        if not isinstance(inputs, list):
-            return ['"import_inputs" must be a list']
-        messages = []
-        for index, item in enumerate(inputs):
-            if not isinstance(item, dict):
-                messages.append(f'"import_inputs[{index}]" must be an object')
-                continue
-            for key in sorted(item):
-                value = item[key]
-                if not isinstance(value, str) and not _is_string_list(value):
-                    messages.append(f'"import_inputs[{index}].{key}" must be '
-                                    'a string or a list of strings')
-        return messages
-
-    # Repository checks: (manifests by path) -> ManifestErrors.
-
-    def _check_unique_import_names(
-            self, manifests: Dict[str, Any]) -> List[ManifestError]:
-        locations = collections.defaultdict(list)
-        for path, manifest in manifests.items():
-            if not isinstance(manifest, dict):
-                continue
-            specs = manifest.get('import_specifications')
-            if not isinstance(specs, list):
-                continue
-            for fields in specs:
-                if isinstance(fields, dict):
-                    name = fields.get('import_name')
-                    if isinstance(name, str) and name:
-                        locations[name].append(path)
-
-        errors = []
-        for name, paths in locations.items():
-            if len(paths) < 2:
-                continue
-            for path in sorted(set(paths)):
-                others = sorted(set(p for p in paths if p != path))
-                parts = []
-                if paths.count(path) > 1:
-                    parts.append(
-                        f'used {paths.count(path)} times in this manifest')
-                if others:
-                    parts.append(f'also used in {", ".join(others)}')
-                errors.append(
-                    ManifestError(
-                        path, name,
-                        f'duplicate "import_name": {"; ".join(parts)}'))
+                for error in check.method(self._checks, manifests))
         return errors
 
 
 # Stateless helpers.
 
 
-def _validate_check_lists(validator: ManifestValidator) -> None:
-    """Checks that the validator's check lists are consistent.
+def _validate_check_lists(checks: List[Check]) -> None:
+    """Checks that the check lists are consistent.
 
     Raises:
-        ValueError: A check id is duplicated, a check has no method, or a
-            disabled check has no reason.
+        ValueError: A check id is duplicated, or a disabled check has no
+            reason.
     """
-    checks = validator.all_checks()
     ids = [check.id for check in checks]
     duplicates = sorted(set(i for i in ids if ids.count(i) > 1))
     if duplicates:
         raise ValueError(f'Duplicate check ids: {", ".join(duplicates)}')
     for check in checks:
-        if not callable(getattr(validator, check.method_name, None)):
-            raise ValueError(f'Check "{check.id}" has no method '
-                             f'{check.method_name}()')
         if not check.enabled and not check.reason:
             raise ValueError(f'Disabled check "{check.id}" needs a reason')
+
+
+def _executor_config_setting_types() -> Dict[str, Any]:
+    """Returns the fields of configs.ExecutorConfig, mapped to their types."""
+    type_hints = typing.get_type_hints(configs.ExecutorConfig)
+    return {
+        field.name: type_hints[field.name]
+        for field in dataclasses.fields(configs.ExecutorConfig)
+    }
 
 
 def _enabled(checks: Tuple[Check, ...]) -> List[Check]:
