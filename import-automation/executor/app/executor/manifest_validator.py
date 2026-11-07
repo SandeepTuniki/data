@@ -41,7 +41,6 @@ invalid usage.
 import argparse
 import collections
 import dataclasses
-import enum
 import json
 import os
 import re
@@ -97,16 +96,6 @@ _GCE_MACHINE_TYPES = (
 )
 
 
-class Scope(enum.Enum):
-    """What a check looks at."""
-    # The manifest as a whole: (manifest_path, manifest) -> messages.
-    MANIFEST = 'manifest'
-    # One import specification: (ImportSpec) -> messages.
-    IMPORT = 'import'
-    # All manifests in the repository: (manifests) -> ManifestErrors.
-    REPO = 'repo'
-
-
 @dataclasses.dataclass(frozen=True)
 class Check:
     """A validation check run by ManifestValidator.
@@ -115,13 +104,11 @@ class Check:
         id: Stable identifier, shown in error messages. The check is
             implemented by the ManifestValidator method named
             '_check_<id with "-" replaced by "_">'.
-        scope: What the check looks at.
         description: What the check verifies.
         enabled: Whether the check runs.
         reason: Why the check is disabled. Required if enabled is False.
     """
     id: str
-    scope: Scope
     description: str
     enabled: bool = True
     reason: str = ''
@@ -184,47 +171,66 @@ class ManifestValidator:
             print(error)
     """
 
-    # Every check the validator runs, in order. Two more checks always run
-    # first and cannot be disabled: 'valid-json' (the file is valid JSON) and
+    # The checks the validator runs, grouped by what they look at. Within a
+    # group, checks run in the order listed. Two checks always run first and
+    # cannot be disabled: 'valid-json' (the file is valid JSON) and
     # 'manifest-structure' (it is an object with a non-empty
     # "import_specifications" list of objects).
     #
     # To turn a check off temporarily, set enabled=False and give a reason,
     # e.g. reason='b/123456: too noisy until the cleanup lands'.
-    CHECKS = (
-        Check('folder-path-chars', Scope.MANIFEST,
+    #
+    # Each check is implemented by the method _check_<id>, with "-" in the id
+    # replaced by "_".
+
+    # yapf: disable
+    # Checks on a manifest file as a whole, run once per manifest.
+    # Method signature: (manifest_path, manifest) -> error messages.
+    MANIFEST_CHECKS = (
+        Check('folder-path-chars',
               'Folder path only uses letters, digits, "_", "-" and "/".'),
-        Check('top-level-fields', Scope.MANIFEST,
+        Check('top-level-fields',
               'Only "import_specifications" is allowed at the top level.'),
-        Check('unknown-fields', Scope.IMPORT,
+    )
+
+    # Checks on one import specification, run once per import.
+    # Method signature: (ImportSpec) -> error messages.
+    IMPORT_CHECKS = (
+        Check('unknown-fields',
               'Imports only have known fields (plus "_comment").'),
-        Check('required-fields', Scope.IMPORT,
+        Check('required-fields',
               'Required fields are present and not empty.'),
-        Check('curator-emails-type', Scope.IMPORT,
+        Check('curator-emails-type',
               'curator_emails is a list of strings.'),
-        Check('field-types', Scope.IMPORT,
+        Check('field-types',
               'Other fields have the right basic types.'),
-        Check('import-name-chars', Scope.IMPORT,
+        Check('import-name-chars',
               'import_name only uses letters, digits, "_" and "-".'),
-        Check('unique-import-names', Scope.REPO,
-              'import_name is unique across all manifests.'),
-        Check('script-syntax', Scope.IMPORT,
+        Check('script-syntax',
               'Script entries are non-empty and can be split into words.'),
-        Check('script-type', Scope.IMPORT,
+        Check('script-type',
               'Scripts end in .py or .sh, or are simple import configs.'),
-        Check('cron-schedule', Scope.IMPORT,
+        Check('cron-schedule',
               'cron_schedule, if set, is accepted by croniter.'),
-        Check('resource-limits-types', Scope.IMPORT,
+        Check('resource-limits-types',
               'resource_limits has known fields with valid types.'),
-        Check('resource-limits-size', Scope.IMPORT,
+        Check('resource-limits-size',
               'resource_limits cpu and memory fit on a machine type.'),
-        Check('config-override', Scope.IMPORT,
+        Check('config-override',
               'config_override sets real executor settings, valid types.'),
-        Check('validation-config-file', Scope.IMPORT,
+        Check('validation-config-file',
               'validation_config_file, if set, exists.'),
-        Check('import-inputs', Scope.IMPORT,
+        Check('import-inputs',
               'import_inputs values are strings or lists of strings.'),
     )
+
+    # Checks across all manifests, run once after all manifests are read.
+    # Method signature: (manifests by path) -> ManifestErrors.
+    REPO_CHECKS = (
+        Check('unique-import-names',
+              'import_name is unique across all manifests.'),
+    )
+    # yapf: enable
 
     def __init__(self, repo_dir: str):
         """Initializes the validator.
@@ -233,10 +239,14 @@ class ManifestValidator:
             repo_dir: Path to the root of the data repository.
 
         Raises:
-            ValueError: CHECKS is inconsistent, e.g. a check has no method.
+            ValueError: The check lists are inconsistent, e.g. a check has no
+                method.
         """
         self._repo_dir = os.path.abspath(repo_dir)
-        self._enabled_checks = _resolve_checks(self, self.CHECKS)
+        _validate_check_lists(self)
+        self._manifest_checks = _enabled(self.MANIFEST_CHECKS)
+        self._import_checks = _enabled(self.IMPORT_CHECKS)
+        self._repo_checks = _enabled(self.REPO_CHECKS)
         # Settings that config_override may change, with their types.
         type_hints = typing.get_type_hints(configs.ExecutorConfig)
         self._executor_setting_types = {
@@ -247,9 +257,14 @@ class ManifestValidator:
     # Public methods.
 
     @classmethod
+    def all_checks(cls) -> List[Check]:
+        """Returns the checks in all check lists."""
+        return list(cls.MANIFEST_CHECKS + cls.IMPORT_CHECKS + cls.REPO_CHECKS)
+
+    @classmethod
     def disabled_checks(cls) -> List[Check]:
-        """Returns the checks in CHECKS that are turned off."""
-        return [check for check in cls.CHECKS if not check.enabled]
+        """Returns the checks that are turned off."""
+        return [check for check in cls.all_checks() if not check.enabled]
 
     def find_manifests(self) -> List[str]:
         """Returns the manifests under statvar_imports/ and scripts/.
@@ -390,7 +405,7 @@ class ManifestValidator:
                              manifest: Any) -> List[ManifestError]:
         """Runs the manifest and import checks on a parsed manifest."""
         errors = []
-        for check in self._enabled_checks[Scope.MANIFEST]:
+        for check in self._manifest_checks:
             errors.extend(
                 ManifestError(manifest_path, None, message, check.id)
                 for message in getattr(self, check.method_name)(manifest_path,
@@ -421,7 +436,7 @@ class ManifestValidator:
                         'import specification must be a JSON object', label))
                 continue
             spec = ImportSpec(manifest_path, label, abs_import_dir, fields)
-            for check in self._enabled_checks[Scope.IMPORT]:
+            for check in self._import_checks:
                 errors.extend(
                     ManifestError(manifest_path, label, message, check.id)
                     for message in getattr(self, check.method_name)(spec))
@@ -431,7 +446,7 @@ class ManifestValidator:
                                                Any]) -> List[ManifestError]:
         """Runs the repository-wide checks on all parsed manifests."""
         errors = []
-        for check in self._enabled_checks[Scope.REPO]:
+        for check in self._repo_checks:
             errors.extend(
                 dataclasses.replace(error, check=check.id)
                 for error in getattr(self, check.method_name)(manifests))
@@ -704,28 +719,29 @@ class ManifestValidator:
 # Stateless helpers.
 
 
-def _resolve_checks(validator: ManifestValidator,
-                    checks: Tuple[Check, ...]) -> Dict[Scope, List[Check]]:
-    """Validates the check table and groups the enabled checks by scope.
+def _validate_check_lists(validator: ManifestValidator) -> None:
+    """Checks that the validator's check lists are consistent.
 
     Raises:
         ValueError: A check id is duplicated, a check has no method, or a
             disabled check has no reason.
     """
+    checks = validator.all_checks()
     ids = [check.id for check in checks]
     duplicates = sorted(set(i for i in ids if ids.count(i) > 1))
     if duplicates:
         raise ValueError(f'Duplicate check ids: {", ".join(duplicates)}')
-    enabled = {scope: [] for scope in Scope}
     for check in checks:
         if not callable(getattr(validator, check.method_name, None)):
             raise ValueError(f'Check "{check.id}" has no method '
                              f'{check.method_name}()')
         if not check.enabled and not check.reason:
             raise ValueError(f'Disabled check "{check.id}" needs a reason')
-        if check.enabled:
-            enabled[check.scope].append(check)
-    return enabled
+
+
+def _enabled(checks: Tuple[Check, ...]) -> List[Check]:
+    """Returns the checks that are turned on."""
+    return [check for check in checks if check.enabled]
 
 
 def _spec_label(fields: Any, index: int) -> str:

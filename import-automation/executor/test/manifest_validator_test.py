@@ -568,37 +568,33 @@ class ValidateTest(ManifestValidatorTestBase):
         ])
 
 
-class CheckTableTest(ManifestValidatorTestBase):
+class CheckListsTest(ManifestValidatorTestBase):
 
-    def test_every_check_method_is_listed_in_checks(self):
-        # A _check_* method missing from CHECKS would silently never run.
-        # To turn a check off, set enabled=False instead of removing it.
+    def test_every_check_method_is_listed(self):
+        # A _check_* method missing from the check lists would silently never
+        # run. To turn a check off, set enabled=False instead of removing it.
         methods = {
             name for name in dir(manifest_validator.ManifestValidator)
             if name.startswith('_check_')
         }
         listed = {
             check.method_name
-            for check in manifest_validator.ManifestValidator.CHECKS
+            for check in manifest_validator.ManifestValidator.all_checks()
         }
         self.assertEqual(methods, listed)
 
     def test_disabled_check_does_not_run(self):
         self.write_spec(cron_schedule='60 5 * * *', source_file=['x'])
-        checks = _with_check_disabled('cron-schedule')
 
-        with mock.patch.object(manifest_validator.ManifestValidator, 'CHECKS',
-                               checks):
+        with _import_check_disabled('cron-schedule'):
             messages = self.messages()
 
         self.assertEqual(messages, ['unknown field "source_file"'])
 
     def test_summary_lists_disabled_checks(self):
         self.write_spec()
-        checks = _with_check_disabled('cron-schedule')
 
-        with mock.patch.object(manifest_validator.ManifestValidator, 'CHECKS',
-                               checks):
+        with _import_check_disabled('cron-schedule'):
             out = io.StringIO()
             manifest_validator.run(self.repo_dir,
                                    [os.path.join(self.repo_dir, _MANIFEST)],
@@ -609,34 +605,37 @@ class CheckTableTest(ManifestValidatorTestBase):
             'The manifest is valid. Disabled checks: cron-schedule.\n')
 
     def test_disabled_check_without_reason_is_rejected(self):
-        checks = tuple(
-            dataclasses.replace(check, enabled=False) if check.id ==
-            'cron-schedule' else check
-            for check in manifest_validator.ManifestValidator.CHECKS)
-
-        with mock.patch.object(manifest_validator.ManifestValidator, 'CHECKS',
-                               checks):
+        with _import_check_disabled('cron-schedule', reason=''):
             with self.assertRaisesRegex(ValueError, 'needs a reason'):
                 manifest_validator.ManifestValidator(self.repo_dir)
 
     def test_check_without_method_is_rejected(self):
-        checks = manifest_validator.ManifestValidator.CHECKS + (
-            manifest_validator.Check('no-such-check',
-                                     manifest_validator.Scope.IMPORT,
-                                     'Does not exist.'),)
+        checks = manifest_validator.ManifestValidator.IMPORT_CHECKS + (
+            manifest_validator.Check('no-such-check', 'Does not exist.'),)
 
-        with mock.patch.object(manifest_validator.ManifestValidator, 'CHECKS',
-                               checks):
+        with mock.patch.object(manifest_validator.ManifestValidator,
+                               'IMPORT_CHECKS', checks):
             with self.assertRaisesRegex(ValueError, '_check_no_such_check'):
                 manifest_validator.ManifestValidator(self.repo_dir)
 
+    def test_duplicate_check_id_across_lists_is_rejected(self):
+        checks = manifest_validator.ManifestValidator.REPO_CHECKS + (
+            manifest_validator.Check('cron-schedule', 'Duplicate.'),)
 
-def _with_check_disabled(check_id):
-    """Returns ManifestValidator.CHECKS with one check disabled."""
-    return tuple(
-        dataclasses.replace(check, enabled=False, reason='test') if check.id ==
+        with mock.patch.object(manifest_validator.ManifestValidator,
+                               'REPO_CHECKS', checks):
+            with self.assertRaisesRegex(ValueError, 'Duplicate check ids'):
+                manifest_validator.ManifestValidator(self.repo_dir)
+
+
+def _import_check_disabled(check_id, reason='test'):
+    """Returns a context manager that disables one of the IMPORT_CHECKS."""
+    checks = tuple(
+        dataclasses.replace(check, enabled=False, reason=reason) if check.id ==
         check_id else check
-        for check in manifest_validator.ManifestValidator.CHECKS)
+        for check in manifest_validator.ManifestValidator.IMPORT_CHECKS)
+    return mock.patch.object(manifest_validator.ManifestValidator,
+                             'IMPORT_CHECKS', checks)
 
 
 class ExecutorRulesInSyncTest(unittest.TestCase):
