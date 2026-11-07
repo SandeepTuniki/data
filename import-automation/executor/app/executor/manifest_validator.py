@@ -186,9 +186,17 @@ class ManifestChecks:
                 by the validation-config-file check.
         """
         if executor_setting_types is None:
-            executor_setting_types = _executor_config_setting_types()
+            executor_setting_types = self._executor_config_setting_types()
         self._executor_setting_types = executor_setting_types
         self._file_exists = file_exists
+
+    def _executor_config_setting_types(self) -> Dict[str, Any]:
+        """Returns the fields of configs.ExecutorConfig, mapped to their types."""
+        type_hints = typing.get_type_hints(configs.ExecutorConfig)
+        return {
+            field.name: type_hints[field.name]
+            for field in dataclasses.fields(configs.ExecutorConfig)
+        }
 
     # Manifest checks: (manifest_path, manifest) -> error messages.
 
@@ -246,11 +254,14 @@ class ManifestChecks:
         return [
             f'required field "{field}" is missing or empty'
             for field in required_fields
-            if _is_empty(spec.fields.get(field))
+            if self._is_empty(spec.fields.get(field))
         ]
 
+    def _is_empty(self, value: Any) -> bool:
+        return value is None or value == '' or value == [] or value == {}
+
     def curator_emails_type(self, spec: ImportSpec) -> List[str]:
-        if 'curator_emails' in spec.fields and not _is_string_list(
+        if 'curator_emails' in spec.fields and not self._is_string_list(
                 spec.fields['curator_emails']):
             return ['"curator_emails" must be a list of strings']
         return []
@@ -265,9 +276,9 @@ class ManifestChecks:
             if field in fields and not isinstance(fields[field], str):
                 messages.append(f'"{field}" must be a string')
         for field in string_list_fields:
-            if field in fields and not _is_string_list(fields[field]):
+            if field in fields and not self._is_string_list(fields[field]):
                 messages.append(f'"{field}" must be a list of strings')
-        if 'user_script_timeout' in fields and not _is_positive_number(
+        if 'user_script_timeout' in fields and not self._is_positive_number(
                 fields['user_script_timeout']):
             messages.append('"user_script_timeout" must be a positive number')
         return messages
@@ -285,7 +296,7 @@ class ManifestChecks:
 
     def script_syntax(self, spec: ImportSpec) -> List[str]:
         messages = []
-        for entry in _script_entries(spec):
+        for entry in self._script_entries(spec):
             if not entry.strip():
                 messages.append('script entry is empty')
                 continue
@@ -299,7 +310,7 @@ class ManifestChecks:
         script_extensions = ('.py', '.sh')
         simple_import_extension = '.json'
         messages = []
-        for entry in _script_entries(spec):
+        for entry in self._script_entries(spec):
             if not entry.strip():
                 continue
             # The executor picks the interpreter from the first space-separated
@@ -308,13 +319,18 @@ class ManifestChecks:
             if script.endswith(script_extensions):
                 continue
             if script.endswith(simple_import_extension) and (
-                    _is_simple_import_config(
+                    self._is_simple_import_config(
                         os.path.join(spec.abs_import_dir, script))):
                 continue
             messages.append(
                 f'script "{script}" must end in .py or .sh (or be a simple '
                 'import config)')
         return messages
+
+    def _is_simple_import_config(self, script_path: str) -> bool:
+        """Returns True if the executor runs script_path as a simple import."""
+        return (_SIMPLE_IMPORT_DIR in script_path and
+                _SIMPLE_IMPORT_CONFIG_PREFIX in script_path)
 
     def cron_schedule(self, spec: ImportSpec) -> List[str]:
         if 'cron_schedule' not in spec.fields:
@@ -340,7 +356,7 @@ class ManifestChecks:
             for field in sorted(set(limits) - allowed_fields)
         ]
         for field in number_fields:
-            if field in limits and not _is_positive_number(limits[field]):
+            if field in limits and not self._is_positive_number(limits[field]):
                 messages.append(f'"resource_limits.{field}" must be a positive '
                                 'number')
         if 'machine' in limits and not isinstance(limits['machine'], str):
@@ -359,10 +375,10 @@ class ManifestChecks:
             if field in limits
         }
         if not requested or not all(
-                _is_positive_number(v) for v in requested.values()):
+                self._is_positive_number(v) for v in requested.values()):
             return []
-        if _fits_some_machine(requested.get('cpu', 0),
-                              requested.get('memory', 0)):
+        if self._fits_some_machine(requested.get('cpu', 0),
+                                   requested.get('memory', 0)):
             return []
         described = ' and '.join(
             f'{field}={value}' for field, value in requested.items())
@@ -370,6 +386,12 @@ class ManifestChecks:
             f'"resource_limits" ({described}) is larger than the largest '
             'available machine type'
         ]
+
+    def _fits_some_machine(self, cpu: float, memory_gib: float) -> bool:
+        """Returns True if some machine type has at least this CPU and memory."""
+        return any(
+            machine_cpus >= cpu and machine_memory_gib >= memory_gib
+            for _, machine_cpus, machine_memory_gib in _GCE_MACHINE_TYPES)
 
     def config_override(self, spec: ImportSpec) -> List[str]:
         if 'config_override' not in spec.fields:
@@ -383,10 +405,32 @@ class ManifestChecks:
             if expected_type is None:
                 messages.append(f'"config_override.{key}" is not an executor '
                                 'setting')
-            elif not _matches_type(override[key], expected_type):
+            elif not self._matches_type(override[key], expected_type):
                 messages.append(f'"config_override.{key}" must be of type '
-                                f'{_type_name(expected_type)}')
+                                f'{self._type_name(expected_type)}')
         return messages
+
+    def _matches_type(self, value: Any, expected_type: Any) -> bool:
+        """Returns True if value is a JSON value of the given Python type."""
+        if expected_type is bool:
+            return isinstance(value, bool)
+        if expected_type is int:
+            return isinstance(value, int) and not isinstance(value, bool)
+        if expected_type is float:
+            return isinstance(value,
+                              (int, float)) and not isinstance(value, bool)
+        if expected_type in (str, dict, list):
+            return isinstance(value, expected_type)
+        if typing.get_origin(expected_type) is list:
+            (item_type,) = typing.get_args(expected_type) or (Any,)
+            return isinstance(value, list) and all(
+                item_type is Any or self._matches_type(item, item_type)
+                for item in value)
+        # Types not used by ExecutorConfig today are not checked.
+        return True
+
+    def _type_name(self, expected_type: Any) -> str:
+        return getattr(expected_type, '__name__', str(expected_type))
 
     def validation_config_file(self, spec: ImportSpec) -> List[str]:
         if 'validation_config_file' not in spec.fields:
@@ -411,7 +455,8 @@ class ManifestChecks:
                 continue
             for key in sorted(item):
                 value = item[key]
-                if not isinstance(value, str) and not _is_string_list(value):
+                if not isinstance(value,
+                                  str) and not self._is_string_list(value):
                     messages.append(f'"import_inputs[{index}].{key}" must be '
                                     'a string or a list of strings')
         return messages
@@ -450,6 +495,23 @@ class ManifestChecks:
                         path, name,
                         f'duplicate "import_name": {"; ".join(parts)}'))
         return errors
+
+    # Helpers shared by several checks.
+
+    def _script_entries(self, spec: ImportSpec) -> List[str]:
+        """Returns the string entries of the spec's scripts list."""
+        scripts = spec.fields.get('scripts')
+        if not isinstance(scripts, list):
+            return []
+        return [entry for entry in scripts if isinstance(entry, str)]
+
+    def _is_string_list(self, value: Any) -> bool:
+        return isinstance(value, list) and all(
+            isinstance(v, str) for v in value)
+
+    def _is_positive_number(self, value: Any) -> bool:
+        return (isinstance(value, (int, float)) and
+                not isinstance(value, bool) and value > 0)
 
 
 class ManifestValidator:
@@ -531,11 +593,31 @@ class ManifestValidator:
                 duplicated.
         """
         self._repo_dir = os.path.abspath(repo_dir)
-        _validate_check_lists(self.all_checks())
-        self._manifest_checks = _enabled(self.MANIFEST_CHECKS)
-        self._import_checks = _enabled(self.IMPORT_CHECKS)
-        self._repo_checks = _enabled(self.REPO_CHECKS)
+        self._validate_check_lists()
+        self._manifest_checks = self._enabled(self.MANIFEST_CHECKS)
+        self._import_checks = self._enabled(self.IMPORT_CHECKS)
+        self._repo_checks = self._enabled(self.REPO_CHECKS)
         self._checks = checks or ManifestChecks()
+
+    def _validate_check_lists(self) -> None:
+        """Checks that the check lists are consistent.
+
+        Raises:
+            ValueError: A check id is duplicated, or a disabled check has no
+                reason.
+        """
+        checks = self.all_checks()
+        ids = [check.id for check in checks]
+        duplicates = sorted(set(i for i in ids if ids.count(i) > 1))
+        if duplicates:
+            raise ValueError(f'Duplicate check ids: {", ".join(duplicates)}')
+        for check in checks:
+            if not check.enabled and not check.reason:
+                raise ValueError(f'Disabled check "{check.id}" needs a reason')
+
+    def _enabled(self, checks: Tuple[Check, ...]) -> List[Check]:
+        """Returns the checks that are turned on."""
+        return [check for check in checks if check.enabled]
 
     # Public methods.
 
@@ -711,7 +793,7 @@ class ManifestValidator:
         abs_import_dir = os.path.join(self._repo_dir,
                                       os.path.dirname(manifest_path))
         for index, fields in enumerate(specs):
-            label = _spec_label(fields, index)
+            label = self._spec_label(fields, index)
             if not isinstance(fields, dict):
                 errors.append(
                     structure_error(
@@ -724,6 +806,14 @@ class ManifestValidator:
                     for message in check.method(self._checks, spec))
         return errors
 
+    def _spec_label(self, fields: Any, index: int) -> str:
+        """Returns the name used to identify an import specification in errors."""
+        if isinstance(fields, dict):
+            name = fields.get('import_name')
+            if isinstance(name, str) and name:
+                return name
+        return f'import_specifications[{index}]'
+
     def _run_repo_checks(self, manifests: Dict[str,
                                                Any]) -> List[ManifestError]:
         """Runs the repository-wide checks on all parsed manifests."""
@@ -733,104 +823,6 @@ class ManifestValidator:
                 dataclasses.replace(error, check=check.id)
                 for error in check.method(self._checks, manifests))
         return errors
-
-
-# Stateless helpers.
-
-
-def _validate_check_lists(checks: List[Check]) -> None:
-    """Checks that the check lists are consistent.
-
-    Raises:
-        ValueError: A check id is duplicated, or a disabled check has no
-            reason.
-    """
-    ids = [check.id for check in checks]
-    duplicates = sorted(set(i for i in ids if ids.count(i) > 1))
-    if duplicates:
-        raise ValueError(f'Duplicate check ids: {", ".join(duplicates)}')
-    for check in checks:
-        if not check.enabled and not check.reason:
-            raise ValueError(f'Disabled check "{check.id}" needs a reason')
-
-
-def _executor_config_setting_types() -> Dict[str, Any]:
-    """Returns the fields of configs.ExecutorConfig, mapped to their types."""
-    type_hints = typing.get_type_hints(configs.ExecutorConfig)
-    return {
-        field.name: type_hints[field.name]
-        for field in dataclasses.fields(configs.ExecutorConfig)
-    }
-
-
-def _enabled(checks: Tuple[Check, ...]) -> List[Check]:
-    """Returns the checks that are turned on."""
-    return [check for check in checks if check.enabled]
-
-
-def _spec_label(fields: Any, index: int) -> str:
-    """Returns the name used to identify an import specification in errors."""
-    if isinstance(fields, dict):
-        name = fields.get('import_name')
-        if isinstance(name, str) and name:
-            return name
-    return f'import_specifications[{index}]'
-
-
-def _script_entries(spec: ImportSpec) -> List[str]:
-    """Returns the string entries of the spec's scripts list."""
-    scripts = spec.fields.get('scripts')
-    if not isinstance(scripts, list):
-        return []
-    return [entry for entry in scripts if isinstance(entry, str)]
-
-
-def _is_empty(value: Any) -> bool:
-    return value is None or value == '' or value == [] or value == {}
-
-
-def _is_string_list(value: Any) -> bool:
-    return isinstance(value, list) and all(isinstance(v, str) for v in value)
-
-
-def _is_positive_number(value: Any) -> bool:
-    return (isinstance(value, (int, float)) and not isinstance(value, bool) and
-            value > 0)
-
-
-def _is_simple_import_config(script_path: str) -> bool:
-    """Returns True if the executor runs script_path as a simple import."""
-    return (_SIMPLE_IMPORT_DIR in script_path and
-            _SIMPLE_IMPORT_CONFIG_PREFIX in script_path)
-
-
-def _fits_some_machine(cpu: float, memory_gib: float) -> bool:
-    """Returns True if some machine type has at least this CPU and memory."""
-    return any(machine_cpus >= cpu and machine_memory_gib >= memory_gib
-               for _, machine_cpus, machine_memory_gib in _GCE_MACHINE_TYPES)
-
-
-def _matches_type(value: Any, expected_type: Any) -> bool:
-    """Returns True if value is a JSON value of the given Python type."""
-    if expected_type is bool:
-        return isinstance(value, bool)
-    if expected_type is int:
-        return isinstance(value, int) and not isinstance(value, bool)
-    if expected_type is float:
-        return isinstance(value, (int, float)) and not isinstance(value, bool)
-    if expected_type in (str, dict, list):
-        return isinstance(value, expected_type)
-    if typing.get_origin(expected_type) is list:
-        (item_type,) = typing.get_args(expected_type) or (Any,)
-        return isinstance(value, list) and all(
-            item_type is Any or _matches_type(item, item_type)
-            for item in value)
-    # Types not used by ExecutorConfig today are not checked.
-    return True
-
-
-def _type_name(expected_type: Any) -> str:
-    return getattr(expected_type, '__name__', str(expected_type))
 
 
 # Command line interface.
