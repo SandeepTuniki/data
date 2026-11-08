@@ -33,7 +33,7 @@ sys.path.append(os.path.join(_DATA_DIR, 'util'))
 sys.path.append(os.path.join(_DATA_DIR, 'tools', 'statvar_importer'))
 
 from file_util import file_get_gcs_blob, file_get_matching, file_is_gcs
-from mcf_file_util import normalize_value
+from mcf_file_util import normalize_value, strip_namespace
 
 # Properties that together identify a StatVarObservation.
 OBSERVATION_KEY_PROPERTIES = [
@@ -61,6 +61,49 @@ def format_raw_prop(value) -> str:
     if isinstance(value, list):
         return ', '.join(str(v).strip() for v in value)
     return str(value).strip() if value is not None else ''
+
+
+def clean_value(value) -> str:
+    """Returns a property value without namespace prefix or enclosing quotes.
+
+    Examples: 'dcid:Count_Person' -> 'Count_Person', 'dcs:geoId/06' ->
+    'geoId/06', '"2020-05"' -> '2020-05'. Text inside quotes is otherwise
+    kept as is. Repeated values are cleaned, sorted and joined with ', '.
+
+    Args:
+      value: a raw property value string, a list of them, or None.
+
+    Returns:
+      The cleaned string; '' for None or empty values.
+    """
+    if isinstance(value, list):
+        return ', '.join(sorted(clean_value(v) for v in value))
+    if value is None:
+        return ''
+    value = str(value).strip()
+    if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+        return value[1:-1]
+    return strip_namespace(value)
+
+
+def is_observation(node: Dict[str, Any]) -> bool:
+    """Returns True if the node's typeOf includes StatVarObservation."""
+    type_of = node.get('typeOf', '')
+    type_of_list = type_of if isinstance(type_of, list) else [type_of]
+    return any('StatVarObservation' in str(t) for t in type_of_list)
+
+
+def schema_value_combined(node: Dict[str, Any]) -> str:
+    """Returns all properties except Node and dcid as sorted 'prop:value' pairs.
+
+    Values are normalized with normalize_prop_val and pairs are joined with ';',
+    identically to ImportDiffer.
+    """
+    props = []
+    for k in sorted(node.keys()):
+        if k not in ('Node', 'dcid'):
+            props.append(f'{k}:{normalize_prop_val(node[k])}')
+    return ';'.join(props)
 
 
 @contextlib.contextmanager

@@ -69,9 +69,11 @@ import differ_utils
 from file_util import file_get_gcs_blob, file_is_gcs
 from mcf_parser import OBSERVATION_KEY_PROPERTIES
 from mcf_parser import format_raw_prop as _format_raw_prop
+from mcf_parser import is_observation
 from mcf_parser import iter_mcf_nodes
 from mcf_parser import normalize_prop_val as _normalize_prop_val
 from mcf_parser import open_text_stream as _open_text_stream
+from mcf_parser import schema_value_combined
 
 OBS_BQ_SCHEMA = [
     bigquery.SchemaField('key_combined', 'STRING'),
@@ -107,9 +109,7 @@ def ensure_bq_dataset(bq_client: bigquery.Client,
 def _flush_node_to_csv(node: Dict[str, Any], obs_writer: csv.writer,
                        schema_writer: csv.writer) -> Tuple[int, int]:
     """Writes a single parsed MCF node to either the observation or schema CSV writer."""
-    type_of = node.get('typeOf', '')
-    type_of_list = type_of if isinstance(type_of, list) else [type_of]
-    if any('StatVarObservation' in str(t) for t in type_of_list):
+    if is_observation(node):
         key_parts = [
             _normalize_prop_val(node.get(prop, ''))
             for prop in OBSERVATION_KEY_PROPERTIES
@@ -129,12 +129,7 @@ def _flush_node_to_csv(node: Dict[str, Any], obs_writer: csv.writer,
         dcid = _normalize_prop_val(raw_id)
         if dcid and not dcid.startswith('dcid:'):
             dcid = f'dcid:{dcid}'
-        props = []
-        for k in sorted(node.keys()):
-            if k not in ('Node', 'dcid'):
-                props.append(f'{k}:{_normalize_prop_val(node[k])}')
-        value_combined = ';'.join(props)
-        schema_writer.writerow([dcid, value_combined])
+        schema_writer.writerow([dcid, schema_value_combined(node)])
         return 0, 1
 
 
