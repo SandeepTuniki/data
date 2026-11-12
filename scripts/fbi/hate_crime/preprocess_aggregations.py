@@ -1769,7 +1769,6 @@ def process_main(input_csv=os.path.join(_SCRIPT_PATH, 'source_data',
     global _SCRIPT_PATH, _INPUT_COLUMNS, _AGGREGATIONS
     output_path = os.path.expanduser(output_path)
     logging.info(f'Processing input: {input_csv}')
-    #with file_util.FileIO(input_csv, 'r') as input_f:
     print(f"Loading input file into df : {input_csv}")
     df = pd.read_csv(input_csv)
     df.columns = df.columns.str.upper()
