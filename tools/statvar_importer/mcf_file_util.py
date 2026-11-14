@@ -425,7 +425,10 @@ def add_mcf_node(
         return False
     dcid = get_node_dcid(pvs)
     if dcid == '':
-        logging.warning(f'Ignoring node without a dcid: {pvs}')
+        logging.error(f'Ignoring node without a dcid: {pvs}')
+        if counters is not None:
+            counters.add_counter('error-mcf-node-without-dcid', 1)
+        return False
     if strip_namespaces:
         dcid = strip_namespace(dcid)
     else:
@@ -573,7 +576,7 @@ def load_mcf_nodes(
                         # MCFs from sheets have quotes escaped as '""<text>""'
                         line = line.replace('""', '"')
                     if line == '':
-                        if pvs:
+                        if _has_properties(pvs):
                             if not add_mcf_node(pvs, nodes, strip_namespaces,
                                                 append_values, normalize,
                                                 counters):
@@ -582,7 +585,7 @@ def load_mcf_nodes(
                                 )
                             else:
                                 num_nodes += 1
-                            pvs = _get_new_node(normalize)
+                        pvs = _get_new_node(normalize)
                     elif line[0] == '#':
                         add_comment_to_node(line, pvs)
                     else:
@@ -592,7 +595,7 @@ def load_mcf_nodes(
                         add_pv_to_node(prop, value, pvs, append_values,
                                        strip_namespaces, normalize)
                         num_props += 1
-                if pvs:
+                if _has_properties(pvs):
                     if not add_mcf_node(pvs, nodes, strip_namespaces,
                                         append_values, normalize, counters):
 
@@ -672,9 +675,11 @@ def get_numeric_value(value: str,
             normalized_value = value.strip()
             if (normalized_value[0].isdigit() or normalized_value[0] == '.' or
                     normalized_value[0] == '-' or normalized_value[0] == '+'):
-                # Input looks like a number. Remove allowed extra characters.
+                # Input looks like a number. Remove allowed extra characters,
+                # but never the decimal character.
+                strip_chars = separator_chars.replace(decimal_char, '')
                 normalized_value = ''.join(
-                    [c for c in normalized_value if c not in separator_chars])
+                    [c for c in normalized_value if c not in strip_chars])
                 # Replace decimal characters with period '.'
                 if decimal_char != '.':
                     normalized_value = '.'.join(
@@ -872,6 +877,9 @@ def normalize_range(value: str, quantity_range_to_dcid: bool = False) -> str:
         unit = unit2
     normalized_range = ''
     if quantity_range_to_dcid:
+        if start in (None, '', '-') and end in (None, '', '-'):
+            # Without numbers, the value is not a range. Keep it as is.
+            return value
         # Normalize quantity range to a dcid
         if unit:
             normalized_range += unit
@@ -913,7 +921,13 @@ def normalize_value(
   Returns:
     normalized value with namespace 'dcid' for dcid values
     sorted list for comma separated values.
+    Numbers are returned as text, for example '5' for '5.0'.
   """
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    if isinstance(value, float):
+        # Return a fixed precision float string.
+        return f'{value}'
     if value:
         if isinstance(value, str):
             value = value.strip()
@@ -932,7 +946,7 @@ def normalize_value(
                 return normalize_range(value, quantity_range_to_dcid)
             # Check if string is a numeric value.
             number = get_numeric_value(value)
-            if number:
+            if number is not None:
                 return normalize_value(number)
             if ' ' in value or ',' in value or is_quoted:
                 return get_quoted_value(value, is_quoted)
@@ -942,9 +956,6 @@ def normalize_value(
                 values = strip_namespace(value).split('__')
                 value = '__'.join(sorted(values))
             return add_namespace(strip_namespace(value))
-        elif isinstance(value, float):
-            # Return a fixed precision float string.
-            return f'{value}'
         elif isinstance(value, list):
             # Sort a list of values normalizing the namespace prefix.
             values = sorted([
@@ -1160,9 +1171,15 @@ def _is_pv_in_dict(prop: str, value: str, pvs: dict) -> bool:
 def _node_has_any_pv(node: dict, pvs: dict) -> bool:
     """Returns true if any property:value of the node is in the pvs dict."""
     for prop, value in node.items():
-        if prop and prop[0] != '#' and _is_pv_in_dict(prop, value, pvs):
+        if (prop and not prop.startswith('#') and
+                _is_pv_in_dict(prop, value, pvs)):
             return True
     return False
+
+
+def _has_properties(pvs: dict) -> bool:
+    """Returns true if pvs has any property other than comments."""
+    return any(prop and not prop.startswith('#') for prop in pvs)
 
 
 def _get_new_node(normalize: bool = True) -> dict:

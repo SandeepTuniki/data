@@ -177,6 +177,37 @@ class SchemaReconcilerTest(unittest.TestCase):
         self.assertIn('oldProp', nodes['node1'])
         self.assertEqual(nodes['node1']['oldProp'], 'NodeInApi')
 
+    def test_remaps_each_value_found_in_api(self):
+        # dc_api_get_node_property returns nodes keyed by dcid, without a dcid
+        # property inside each node.
+        api_response = {
+            'dcid:OldApiVal1': {
+                'supercededBy': 'dcid:NewApiVal1'
+            },
+            'dcid:OldApiVal2': {
+                'supercededBy': 'dcid:NewApiVal2'
+            },
+        }
+        self.reconciler._config.set_config('recon_lookup_api', True)
+        nodes = {
+            'node1': {
+                'prop1': 'dcid:OldApiVal1'
+            },
+            'node2': {
+                'prop1': 'dcid:OldApiVal2'
+            },
+        }
+
+        with mock.patch.object(schema_reconciler.dc_api,
+                               'dc_api_get_node_property',
+                               return_value=api_response):
+            num_remapped = self.reconciler.reconcile_nodes(
+                nodes, keep_legacy_obs=False)
+
+        self.assertEqual(num_remapped, 2)
+        self.assertEqual(nodes['node1']['prop1'], 'dcid:NewApiVal1')
+        self.assertEqual(nodes['node2']['prop1'], 'dcid:NewApiVal2')
+
 
 if __name__ == '__main__':
     unittest.main()

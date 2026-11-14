@@ -342,7 +342,8 @@ class SchemaReconciler:
             list(lookup_dcids), 'supercededBy')
         self._counters.add_counter('recon-lookup-schema', len(lookup_dcids))
         for dcid, node in new_schema_nodes.items():
-            add_mcf_node(node, schema_nodes)
+            # The API response is keyed by dcid, without a dcid in the node.
+            add_mcf_node({'Node': dcid, **node}, schema_nodes)
             self._counters.add_counter('recon-lookup-schema-response', 1)
             self._counters.add_counter('recon-schema-nodes', 1)
 
