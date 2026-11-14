@@ -34,14 +34,22 @@ from absl import logging
 
 _FLAGS = flags.FLAGS
 
-flags.DEFINE_string(
-    'ignore_mcf',
-    '',
-    'Comma separated list of MCF files with nodes to be dropped from output',
-)
-flags.DEFINE_list('ignore_dcids', [], 'List of dcids to be ignored')
-flags.DEFINE_bool('ignore_existing_nodes', True,
-                  'Drop nodes that are defined in DC API.')
+
+def _define_flags() -> None:
+    """Defines command-line flags for this script."""
+    flags.DEFINE_string('input_mcf', '',
+                        'Comma separated list of MCF files to filter.')
+    flags.DEFINE_string('output_mcf', '',
+                        'Output MCF file for nodes that are not dropped.')
+    flags.DEFINE_string(
+        'ignore_mcf',
+        '',
+        'Comma separated list of MCF files with nodes to be dropped from output',
+    )
+    flags.DEFINE_list('ignore_dcids', [], 'List of dcids to be ignored')
+    flags.DEFINE_bool('ignore_existing_nodes', True,
+                      'Drop nodes that are defined in DC API.')
+
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(_SCRIPT_DIR)
@@ -195,4 +203,5 @@ def main(_):
 
 
 if __name__ == '__main__':
+    _define_flags()
     app.run(main)
