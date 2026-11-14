@@ -108,13 +108,14 @@ def add_namespace(value: str, namespace: str = 'dcid') -> str:
   Quoted strings are assumed to start with '"' and won't get a namespace.
   """
     if isinstance(value, list):
-        value_list = [add_namespace(v) for v in value]
+        value_list = [add_namespace(v, namespace) for v in value]
         return ','.join(value_list)
     if value and isinstance(value, str):
         if value[0].isalpha() or value[0].isdigit():
             if ',' in value:
                 value_list = get_value_list(value)
-                return ','.join([add_namespace(v) for v in value_list])
+                return ','.join(
+                    [add_namespace(v, namespace) for v in value_list])
             has_alpha = False
             for c in value:
                 if c.isalpha() or c == '_' or c == '/':
@@ -165,8 +166,7 @@ def strip_value(value: str) -> str:
     if value and isinstance(value, str):
         value = value.strip()
         if value and value[0] == '"' and value[-1] == '"':
-            value_str = value[1:-1]
-            value_str.strip()
+            value_str = value[1:-1].strip()
             value = '"' + value_str + '"'
     return value
 
@@ -316,7 +316,7 @@ def get_node_dcid(pvs: dict) -> str:
         return ''
     dcid = pvs.get('Node', '')
     dcid = pvs.get('dcid', dcid)
-    dcid = dcid.strip(' "')
+    dcid = str(dcid).strip(' "')
     return strip_namespace(dcid)
 
 
@@ -472,14 +472,14 @@ def update_mcf_nodes(
   Returns:
     dictionary of output_nodes updated with property:values from nodes.
   """
-    index = 0
-    for key, node in nodes.items():
+    for index, (key, node) in enumerate(nodes.items()):
         # Set the node dcid if not present.
         dcid = get_node_dcid(node)
         if not dcid:
             dcid = key
             if not key:
                 dcid = str(index)
+            node = dict(node)
             node['Node'] = add_namespace(dcid)
         # Add PVs from node to output_nodes
         add_mcf_node(node, output_nodes, strip_namespaces, append_values,
@@ -550,10 +550,11 @@ def load_mcf_nodes(
                 if 'Node' not in pvs:
                     pvs['Node'] = key
                 num_props += len(pvs)
-                if not add_mcf_node(pvs, nodes, strip_namespaces, append_values,
-                                    normalize, counters):
+                if add_mcf_node(pvs, nodes, strip_namespaces, append_values,
+                                normalize, counters):
+                    num_nodes += 1
+                else:
                     logging.error(f'Unable to add node from {file}: {pvs}')
-            num_nodes = len(file_nodes)
         else:
             # Load nodes from MCF file.
             line_number = 0
@@ -598,7 +599,8 @@ def load_mcf_nodes(
                         logging.error(
                             f'Unable to add node from {file}:{line_number}: {pvs}'
                         )
-                    num_nodes += 1
+                    else:
+                        num_nodes += 1
         logging.info(
             f'Loaded {num_nodes} nodes with {num_props} properties from file {file}'
         )
@@ -1078,8 +1080,8 @@ def write_mcf_nodes(
         node_dicts = [node_dicts]
     if filename.endswith('.csv'):
         # Write PVs as a csv
-        node_dict = node_dicts[0]
-        for d in node_dicts[1:]:
+        node_dict = {}
+        for d in node_dicts:
             node_dict.update(d)
         file_util.file_write_csv_dict(node_dict, filename)
         return

@@ -615,6 +615,43 @@ class TestLoadMcfNodes(unittest.TestCase):
         self.assertIs(nodes, existing_nodes)
         self.assertCountEqual(nodes.keys(), ['dcid:Utah', 'dcid:Ohio'])
 
+    def test_nodes_loaded_counter_skips_rejected_last_node(self):
+        mcf_file = _write_mcf_file(self.tmp_dir, 'nodes.mcf', [
+            'Node: dcid:Count_Person',
+            'typeOf: dcs:StatisticalVariable',
+            'populationType: dcs:Person',
+            '',
+            'Node: dcid:Count_Person',
+            'typeOf: dcs:StatisticalVariable',
+            'populationType: dcs:Household',
+        ])
+        counters = Counters()
+
+        mcf_file_util.load_mcf_nodes(mcf_file, counters=counters)
+
+        self.assertEqual(counters.get_counter('mcf-nodes-loaded'), 1)
+
+    def test_nodes_loaded_counter_skips_rejected_csv_node(self):
+        existing_nodes = {
+            'dcid:Count_Person': {
+                'Node': 'dcid:Count_Person',
+                'typeOf': 'dcs:StatisticalVariable',
+                'populationType': 'dcs:Person',
+            }
+        }
+        csv_file = _write_mcf_file(self.tmp_dir, 'nodes.csv', [
+            'Node,typeOf,populationType',
+            'dcid:Count_Person,dcs:StatisticalVariable,dcs:Household',
+            'dcid:Ohio,dcs:State,',
+        ])
+        counters = Counters()
+
+        mcf_file_util.load_mcf_nodes(csv_file,
+                                     nodes=existing_nodes,
+                                     counters=counters)
+
+        self.assertEqual(counters.get_counter('mcf-nodes-loaded'), 1)
+
 
 class TestWriteMcfNodes(unittest.TestCase):
 
@@ -747,6 +784,18 @@ class TestWriteMcfNodes(unittest.TestCase):
 
         self.assertEqual(loaded_nodes, nodes)
 
+    def test_csv_output_with_several_dicts_does_not_change_input(self):
+        ohio = {'dcid:Ohio': {'Node': 'dcid:Ohio', 'typeOf': 'dcs:State'}}
+        utah = {'dcid:Utah': {'Node': 'dcid:Utah', 'typeOf': 'dcs:State'}}
+        csv_file = os.path.join(self.tmp_dir, 'nodes.csv')
+
+        mcf_file_util.write_mcf_nodes([ohio, utah], csv_file)
+
+        self.assertEqual(list(ohio.keys()), ['dcid:Ohio'])
+        self.assertCountEqual(
+            mcf_file_util.load_mcf_nodes(csv_file).keys(),
+            ['dcid:Ohio', 'dcid:Utah'])
+
     def test_mcf_output_can_be_loaded_back_for_sample_statvars(self):
         nodes = mcf_file_util.load_mcf_nodes(
             os.path.join(_module_dir_, 'test_data',
@@ -781,6 +830,9 @@ class TestNodeHelpers(unittest.TestCase):
 
     def test_get_node_dcid_returns_empty_string_for_empty_node(self):
         self.assertEqual(mcf_file_util.get_node_dcid({}), '')
+
+    def test_get_node_dcid_converts_numeric_dcid_to_string(self):
+        self.assertEqual(mcf_file_util.get_node_dcid({'dcid': 123}), '123')
 
     def test_check_nodes_can_merge_rejects_different_dcids(self):
         self.assertFalse(
@@ -856,6 +908,33 @@ class TestNodeHelpers(unittest.TestCase):
                 },
             })
 
+    def test_update_mcf_nodes_does_not_change_input_nodes(self):
+        new_nodes = {'': {'name': '"Ohio"'}}
+
+        mcf_file_util.update_mcf_nodes(new_nodes, {})
+
+        self.assertEqual(new_nodes, {'': {'name': '"Ohio"'}})
+
+    def test_update_mcf_nodes_gives_each_node_without_dcid_its_own_id(self):
+        # Dict keys are unique, so '' and None are the only way to have two
+        # nodes without a key or dcid.
+        new_nodes = {'': {'name': '"Ohio"'}, None: {'name': '"Utah"'}}
+        output_nodes = {}
+
+        mcf_file_util.update_mcf_nodes(new_nodes, output_nodes)
+
+        self.assertEqual(
+            output_nodes, {
+                '0': {
+                    'name': '"Ohio"',
+                    'Node': '0'
+                },
+                '1': {
+                    'name': '"Utah"',
+                    'Node': '1'
+                },
+            })
+
 
 class TestNormalizeValue(unittest.TestCase):
     """normalize_value is relied on by import_differ to avoid reporting
@@ -899,6 +978,19 @@ class TestNormalizeValue(unittest.TestCase):
 
 
 class TestValueHelpers(unittest.TestCase):
+
+    def test_strip_value_strips_spaces_inside_quotes(self):
+        self.assertEqual(mcf_file_util.strip_value('  " Ohio  "  '), '"Ohio"')
+
+    def test_add_namespace_uses_given_namespace_for_list(self):
+        self.assertEqual(
+            mcf_file_util.add_namespace(['Ohio', 'Utah'], namespace='schema'),
+            'schema:Ohio,schema:Utah')
+
+    def test_add_namespace_uses_given_namespace_for_comma_separated_value(self):
+        self.assertEqual(
+            mcf_file_util.add_namespace('Ohio,Utah', namespace='schema'),
+            'schema:Ohio,schema:Utah')
 
     def test_normalize_pv_joins_property_and_normalized_value(self):
         self.assertEqual(
