@@ -616,46 +616,34 @@ def filter_mcf_nodes(
 
   Args:
     nodes: dictionary of nodes keyed by dcid.
-    allow_dcids: list of dcids to be returned.
-    allow_nodes_with_pv: list of properties nodes with any of the properties in
-      the list are returned.
-    ignore_nodes_with_pv: list of properties to be ignored. nodes with any of
-      the properties in the list are dropped.
+    allow_dcids: list of dcids to be returned. Other nodes are dropped.
+    allow_nodes_with_pv: list of '<property>:<value>' strings. Only nodes with
+      at least one of them are returned. A '<property>' without a value matches
+      any value for that property.
+    ignore_nodes_with_pv: list of '<property>:<value>' strings. Nodes with any
+      of them are dropped. A '<property>' without a value matches any value for
+      that property.
 
   Returns:
     dictionary with the filtered nodes.
   """
-    # Normalize ignored PVs.
-    ignored_pvs = set()
+    allowed_dcids = set()
+    if allow_dcids:
+        allowed_dcids = {strip_namespace(dcid) for dcid in allow_dcids}
     ignored_pvs = _pv_list_to_dict(ignore_nodes_with_pv)
-    compared_pvs = _pv_list_to_dict(allow_nodes_with_pv)
+    allowed_pvs = _pv_list_to_dict(allow_nodes_with_pv)
     filtered_nodes = {}
     for k, v in nodes.items():
-        # Drop nodes with dcid not in allowed list.
-        if allow_dcids and strip_namespace(k) in allow_dcids:
-            logging.log(2, f'Dropping dcid not in compare_dcid: {k}, {v}')
+        if allowed_dcids and strip_namespace(k) not in allowed_dcids:
+            logging.log(2, f'Dropping dcid not in allow_dcids: {k}, {v}')
             continue
-        # Drop nodes containing any ignored property value.
-        drop_node = False
-        for prop, value in v.items():
-            if prop and prop[0] != '#':
-                if _is_pv_in_dict(prop, value, ignored_pvs):
-                    logging.log(
-                        2,
-                        f'Dropping dcid with ignored pv {prop}:{value}: {k}, {v}'
-                    )
-                    drop_node = True
-                    break
-                if compared_pvs and not _is_pv_in_dict(prop, value,
-                                                       compared_pvs):
-                    logging.log(
-                        2,
-                        f'Dropping dcid without any compared pv {prop}:{value}: {k}, {v}',
-                    )
-                    drop_node = True
-                    break
-        if not drop_node:
-            filtered_nodes[k] = v
+        if ignored_pvs and _node_has_any_pv(v, ignored_pvs):
+            logging.log(2, f'Dropping dcid with ignored pv: {k}, {v}')
+            continue
+        if allowed_pvs and not _node_has_any_pv(v, allowed_pvs):
+            logging.log(2, f'Dropping dcid without any allowed pv: {k}, {v}')
+            continue
+        filtered_nodes[k] = v
     return filtered_nodes
 
 
@@ -1129,8 +1117,12 @@ def _get_prop_value_line(prop, value) -> str:
 
 
 def _pv_list_to_dict(pv_list: list) -> dict:
-    """Convert a list of property:value into a set of PVs."""
-    pvs = set()
+    """Returns a dict of property to a set of normalized values.
+
+    Each item in pv_list is a '<property>:<value>' string. A '<property>'
+    without a value is added with an empty value, which matches any value.
+    """
+    pvs = {}
     if not pv_list:
         return pvs
 
@@ -1159,6 +1151,14 @@ def _is_pv_in_dict(prop: str, value: str, pvs: dict) -> bool:
         if value and value in pvs[prop]:
             return True
         if '' in pvs[prop]:
+            return True
+    return False
+
+
+def _node_has_any_pv(node: dict, pvs: dict) -> bool:
+    """Returns true if any property:value of the node is in the pvs dict."""
+    for prop, value in node.items():
+        if prop and prop[0] != '#' and _is_pv_in_dict(prop, value, pvs):
             return True
     return False
 

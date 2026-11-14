@@ -913,3 +913,68 @@ class TestValueHelpers(unittest.TestCase):
 
     def test_get_numeric_value_accepts_periods_as_thousands_separators(self):
         self.assertEqual(mcf_file_util.get_numeric_value('1.234.567'), 1234567)
+
+
+class TestFilterMcfNodes(unittest.TestCase):
+
+    def setUp(self):
+        self.nodes = {
+            'dcid:Ohio': {
+                'Node': 'dcid:Ohio',
+                'typeOf': 'dcs:State',
+                'name': '"Ohio"',
+            },
+            'dcid:Count_Person': {
+                'Node': 'dcid:Count_Person',
+                'typeOf': 'dcs:StatisticalVariable',
+                'populationType': 'dcs:Person',
+            },
+            'dcid:GenderEnum': {
+                'Node': 'dcid:GenderEnum',
+                'typeOf': 'dcs:Class',
+            },
+        }
+
+    def test_returns_all_nodes_without_filters(self):
+        filtered = mcf_file_util.filter_mcf_nodes(self.nodes)
+
+        self.assertEqual(filtered, self.nodes)
+
+    def test_allow_dcids_keeps_only_listed_nodes(self):
+        filtered = mcf_file_util.filter_mcf_nodes(
+            self.nodes, allow_dcids=['Ohio', 'GenderEnum'])
+
+        self.assertCountEqual(filtered.keys(), ['dcid:Ohio', 'dcid:GenderEnum'])
+
+    def test_allow_dcids_accepts_dcids_with_namespace(self):
+        filtered = mcf_file_util.filter_mcf_nodes(self.nodes,
+                                                  allow_dcids=['dcid:Ohio'])
+
+        self.assertCountEqual(filtered.keys(), ['dcid:Ohio'])
+
+    def test_ignore_nodes_with_pv_drops_nodes_with_listed_value(self):
+        filtered = mcf_file_util.filter_mcf_nodes(
+            self.nodes, ignore_nodes_with_pv=['typeOf:State'])
+
+        self.assertCountEqual(filtered.keys(),
+                              ['dcid:Count_Person', 'dcid:GenderEnum'])
+
+    def test_ignore_nodes_with_pv_without_value_drops_nodes_with_property(self):
+        filtered = mcf_file_util.filter_mcf_nodes(
+            self.nodes, ignore_nodes_with_pv=['populationType'])
+
+        self.assertCountEqual(filtered.keys(), ['dcid:Ohio', 'dcid:GenderEnum'])
+
+    def test_allow_nodes_with_pv_keeps_nodes_with_any_listed_value(self):
+        # Ohio has other properties (Node, name) that are not listed, and is
+        # still kept because its typeOf matches.
+        filtered = mcf_file_util.filter_mcf_nodes(
+            self.nodes, allow_nodes_with_pv=['typeOf:State', 'typeOf:Class'])
+
+        self.assertCountEqual(filtered.keys(), ['dcid:Ohio', 'dcid:GenderEnum'])
+
+    def test_allow_nodes_with_pv_without_value_keeps_nodes_with_property(self):
+        filtered = mcf_file_util.filter_mcf_nodes(
+            self.nodes, allow_nodes_with_pv=['populationType'])
+
+        self.assertCountEqual(filtered.keys(), ['dcid:Count_Person'])
