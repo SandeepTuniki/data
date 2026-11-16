@@ -1,0 +1,33 @@
+{
+    "import_specifications": [
+        {
+            "import_name": "WikidataPopulation",
+            "curator_emails": [
+                "support@datacommons.org"
+            ],
+            "provenance_url": "https://www.wikidata.org/wiki/Wikidata:Main_Page",
+            "provenance_description": "Population counts and demographic statistics for geographic entities extracted from Wikidata.",
+            "scripts": [
+                "fetch_population.py --places_csv=input_files/places.csv --output_csv=input_files/wikidata_population_raw.csv",
+                "preprocess_population.py --input_csv=input_files/wikidata_population_raw.csv --output_csv=input_files/wikidata_population_preprocessed.csv",
+                "../../../tools/statvar_importer/stat_var_processor.py --input_data=input_files/wikidata_population_preprocessed.csv --pv_map=wikidata_population_pvmap.csv --config_file=wikidata_population_statvar_processor_config.csv --output_path=output/wikidata_population --output_counters=counters/wikidata_population_counters.csv"
+            ],
+            "import_inputs": [
+                {
+                    "template_mcf": "output/wikidata_population.tmcf",
+                    "cleaned_csv": "output/wikidata_population.csv"
+                }
+            ],
+            "source_files": [
+                "input_files/*.csv",
+                "counters/*.csv",
+                "wikidata_population_pvmap.csv",
+                "wikidata_population_statvar_processor_config.csv"
+            ],
+            "config_override": {
+                "disable_import_workflow": true,
+                "skip_prod_ingestion": true
+            }
+        }
+    ]
+}

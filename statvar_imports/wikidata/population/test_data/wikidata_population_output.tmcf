@@ -1,0 +1,7 @@
+Node: E:wikidata_population_output->E0
+observationAbout: C:wikidata_population_output->observationAbout
+observationDate: C:wikidata_population_output->observationDate
+value: C:wikidata_population_output->value
+measurementMethod: dcid:WikidataPopulation
+typeOf: dcs:StatVarObservation
+variableMeasured: dcid:Count_Person
