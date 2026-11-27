@@ -34,12 +34,10 @@ import validator_goldens
 class TestValidatorGoldens(unittest.TestCase):
 
     def test_get_validator_goldens_config(self):
-        with patch('validator_goldens._FLAGS') as mock_flags:
-            mock_flags.goldens_ignore_property = ['p1']
-            mock_flags.goldens_key_property = ['p2']
-            config = validator_goldens.get_validator_goldens_config()
-            self.assertEqual(config['goldens_ignore_property'], ['p1'])
-            self.assertEqual(config['goldens_key_property'], ['p2'])
+        config = validator_goldens.get_validator_goldens_config(
+            goldens_ignore_property=['p1'], goldens_key_property=['p2'])
+        self.assertEqual(config['goldens_ignore_property'], ['p1'])
+        self.assertEqual(config['goldens_key_property'], ['p2'])
 
     def test_validator_compare_nodes(self):
         input_nodes = {

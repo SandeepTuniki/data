@@ -125,8 +125,6 @@ EXCLUDED_FILES = frozenset({
     'scripts/us_epa/airqualityindex/air_quality_aggregate.py',
     'scripts/us_usda/quickstats/process.py',
     'tools/import_differ/import_differ.py',
-    'tools/import_validation/validator_goldens.py',
-    'tools/sdmx_import/sdmx_cli.py',
     'tools/statvar_importer/config_flags.py',
     'tools/statvar_importer/data_sampler.py',
     'tools/statvar_importer/filter_data_outliers.py',
@@ -150,7 +148,6 @@ EXCLUDED_FILES = frozenset({
     'tools/statvar_importer/schema/schema_spell_checker.py',
     'tools/statvar_importer/semantic_matcher.py',
     'util/counters.py',
-    'util/file_sharder.py',
     'util/log_util.py',
 })
 

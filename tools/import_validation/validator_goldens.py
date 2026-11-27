@@ -90,62 +90,77 @@ import file_util
 from mcf_diff import fingerprint_node
 import mcf_file_util
 
-flags.DEFINE_list('validate_goldens_input', None,
-                  'List of files to be compared against goldens.')
-flags.DEFINE_list('validate_goldens', None,
-                  'List of golden files to be compared against')
-flags.DEFINE_string('generate_goldens', None,
-                    'Golden file to be generated from the input.')
-flags.DEFINE_string('validate_goldens_output', None,
-                    'Output file with missing goldens')
-flags.DEFINE_list('goldens_key_property', [],
-                  'Properties in golden nodes to be compared.')
-flags.DEFINE_list('goldens_ignore_property', ['value'],
-                  'Properties in golden nodes to be ignored.')
-flags.DEFINE_list(
-    'generate_goldens_property_sets', [],
-    'List of property sets to generate goldens for. '
-    'Each set is a pipe (|) separated list of properties. '
-    'Example: "variableMeasured|observationAbout,observationDate"')
-flags.DEFINE_integer(
-    'goldens_sample_rows', 0,
-    'Number of input rows to sample for generating goldens. '
-    'If 0, all rows are used.')
-flags.DEFINE_boolean(
-    'goldens_sampler_exhaustive', False,
-    'If True, uses exhaustive sampling to capture every '
-    'unique value in the input nodes.')
-flags.DEFINE_list(
-    'goldens_must_include', [],
-    'List of "column:file" pairs containing values (e.g. prominent DCIDs) '
-    'that MUST be included in the generated goldens if they appear '
-    'in the input data. '
-    'Example: "variableMeasured:website/tools/nl/embeddings/input/base/sheets_svs.csv,observationAbout:places.txt"'
-)
-flags.DEFINE_string('goldens_ignore_comments', '#',
-                    'Prefix for comments to be ignored in the golden set.')
+
+def _define_flags() -> None:
+    """Defines command-line flags for this script."""
+    flags.DEFINE_list('validate_goldens_input', None,
+                      'List of files to be compared against goldens.')
+    flags.DEFINE_list('validate_goldens', None,
+                      'List of golden files to be compared against')
+    flags.DEFINE_string('generate_goldens', None,
+                        'Golden file to be generated from the input.')
+    flags.DEFINE_string('validate_goldens_output', None,
+                        'Output file with missing goldens')
+    flags.DEFINE_list('goldens_key_property', [],
+                      'Properties in golden nodes to be compared.')
+    flags.DEFINE_list('goldens_ignore_property', ['value'],
+                      'Properties in golden nodes to be ignored.')
+    flags.DEFINE_list(
+        'generate_goldens_property_sets', [],
+        'List of property sets to generate goldens for. '
+        'Each set is a pipe (|) separated list of properties. '
+        'Example: "variableMeasured|observationAbout,observationDate"')
+    flags.DEFINE_integer(
+        'goldens_sample_rows', 0,
+        'Number of input rows to sample for generating goldens. '
+        'If 0, all rows are used.')
+    flags.DEFINE_boolean(
+        'goldens_sampler_exhaustive', False,
+        'If True, uses exhaustive sampling to capture every '
+        'unique value in the input nodes.')
+    flags.DEFINE_list(
+        'goldens_must_include', [],
+        'List of "column:file" pairs containing values (e.g. prominent DCIDs) '
+        'that MUST be included in the generated goldens if they appear '
+        'in the input data. '
+        'Example: "variableMeasured:website/tools/nl/embeddings/input/base/sheets_svs.csv,observationAbout:places.txt"'
+    )
+    flags.DEFINE_string('goldens_ignore_comments', '#',
+                        'Prefix for comments to be ignored in the golden set.')
+
 
 _FLAGS = flags.FLAGS
 
 
-def get_validator_goldens_config() -> dict:
-    """Returns a dictionary of config parameters for MCF diff from flags.
+def get_validator_goldens_config(
+        goldens_ignore_property: list = None,
+        goldens_key_property: list = None,
+        goldens_must_include: list = None,
+        goldens_ignore_comments: str = '#',
+        goldens_sample_rows: int = 0,
+        goldens_sampler_exhaustive: bool = False) -> dict:
+    """Returns a dictionary of config parameters for MCF diff.
 
     The config includes properties to ignore and properties to use as keys
-    for matching nodes, derived from command-line flags.
+    for matching nodes. main() passes the command-line flag values. The
+    defaults are the flag defaults.
     """
-    if not _FLAGS.is_parsed():
-        _FLAGS.mark_as_parsed()
+    if goldens_ignore_property is None:
+        goldens_ignore_property = ['value']
+    if goldens_key_property is None:
+        goldens_key_property = []
+    if goldens_must_include is None:
+        goldens_must_include = []
     return {
-        'goldens_ignore_property': _FLAGS.goldens_ignore_property,
-        'goldens_key_property': _FLAGS.goldens_key_property,
-        'goldens_must_include': _FLAGS.goldens_must_include,
-        'goldens_ignore_comments': _FLAGS.goldens_ignore_comments,
+        'goldens_ignore_property': goldens_ignore_property,
+        'goldens_key_property': goldens_key_property,
+        'goldens_must_include': goldens_must_include,
+        'goldens_ignore_comments': goldens_ignore_comments,
 
         # config options for data_sampler when generating goldens
-        'sampler_output_rows': _FLAGS.goldens_sample_rows,
-        'sampler_exhaustive': _FLAGS.goldens_sampler_exhaustive,
-        'sampler_column_keys': _FLAGS.goldens_must_include,
+        'sampler_output_rows': goldens_sample_rows,
+        'sampler_exhaustive': goldens_sampler_exhaustive,
+        'sampler_column_keys': goldens_must_include,
     }
 
 
@@ -523,6 +538,13 @@ def main(_):
     """Main entry point for the validator script."""
     logging.set_verbosity(2)
     counters = Counters()
+    config = get_validator_goldens_config(
+        goldens_ignore_property=_FLAGS.goldens_ignore_property,
+        goldens_key_property=_FLAGS.goldens_key_property,
+        goldens_must_include=_FLAGS.goldens_must_include,
+        goldens_ignore_comments=_FLAGS.goldens_ignore_comments,
+        goldens_sample_rows=_FLAGS.goldens_sample_rows,
+        goldens_sampler_exhaustive=_FLAGS.goldens_sampler_exhaustive)
 
     if _FLAGS.generate_goldens:
         # Generation Mode
@@ -533,16 +555,17 @@ def main(_):
         generate_goldens(_FLAGS.validate_goldens_input,
                          property_sets,
                          output_file=_FLAGS.generate_goldens,
-                         config=get_validator_goldens_config(),
+                         config=config,
                          counters=counters)
     if _FLAGS.validate_goldens:
         # Validation Mode
         validate_goldens(_FLAGS.validate_goldens_input,
                          _FLAGS.validate_goldens,
                          output_file=_FLAGS.validate_goldens_output,
-                         config=get_validator_goldens_config(),
+                         config=config,
                          counters=counters)
 
 
 if __name__ == '__main__':
+    _define_flags()
     app.run(main)

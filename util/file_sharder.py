@@ -131,67 +131,80 @@ _DCID_IGNORE_PROPS = DCID_IGNORE_PROPS
 
 _FLAGS = flags.FLAGS
 
-flags.DEFINE_string('shard_input', '', 'Input files to be sharded')
-flags.DEFINE_string('shard_output', '', 'Output file pattern for sharded file')
-flags.DEFINE_string(
-    'shard_key', '', 'Key or column to shard an input record. Defaults to '
-    'dcid, else Node, else the first column.')
-flags.DEFINE_integer('shard_key_prefix_length', 0,
-                     'Length of key value to use for sharding')
-flags.DEFINE_integer('shard_count', 0, 'Number of output shards to generate.')
-flags.DEFINE_integer(
-    'records_per_shard', _DEFAULT_RECORDS_PER_SHARD,
-    'Number of records per output shard if shard_count is not set.')
-flags.DEFINE_bool('shard_skip_duplicates', False, 'Skip duplicate records.')
-flags.DEFINE_integer('shard_input_records', sys.maxsize,
-                     'Limit the number of input records to shard.')
-flags.DEFINE_list('shard_headers', [], 'Header columns for sharded outputs.')
-flags.DEFINE_float(
-    'shard_sample_rate', 1,
-    'Fraction of shard keys to keep, in the range [0, 1]. All records with '
-    'the same shard key are kept or dropped together.')
-flags.DEFINE_integer(
-    'shard_threads', _DEFAULT_SHARD_THREADS,
-    'Maximum number of parallel threads for reading inputs. Defaults to 50% '
-    'of available CPU cores.')
-flags.DEFINE_integer(
-    'shard_min_chunk_size', _DEFAULT_MIN_CHUNK_SIZE,
-    'Minimum byte size of chunks when splitting a file across parallel workers.'
-)
-flags.DEFINE_string(
-    'shard_default_pvs', '',
-    'Default property values to add to a record when the property is missing '
-    'or empty, separated by ";", each as <property>:<value> or '
-    '<property>=<value>. A value can be a comma separated list. Example: '
-    '"typeOf:dcs:StatVarObservation;measurementMethod=dcs:A,dcs:B".')
-flags.DEFINE_bool(
-    'shard_generate_dcid', False,
-    'Generate a deterministic dcid for records that do not have a dcid/Node.')
-flags.DEFINE_list(
-    'shard_dcid_ignore_props', [],
-    'Additional properties to ignore when generating a dcid for a record.')
 
-flags.DEFINE_string(
-    'shard_output_columns', None,
-    'Output columns separated by ";", each as <column> to copy the input '
-    'value, "*" to copy all non-ignored input columns, or '
-    '<column>=<expression>, a fixed value, format template, or Python '
-    'expression with the input columns as variables. Example: '
-    '"dcid;value=int(v)*2;label=f\'{id}-{year}\';typeOf=\'StatVarObservation\'".'
-)
-flags.DEFINE_string(
-    'shard_add_columns', '',
-    'Columns to add or override in output records while keeping non-ignored '
-    'input columns, separated by ";", each as <column> or '
-    '<column>=<value_or_expression>. Example: '
-    '"dcid;typeOf=dcid:StatVarObservation;observationAbout=dcid:geoId/{fips}".')
-flags.DEFINE_list(
-    'shard_ignore_columns', [],
-    'Column names or regular expressions (e.g. "#input,^#.*") to exclude '
-    'from output records.')
-flags.DEFINE_string(
-    'shard_encoding', None,
-    'Optional character encoding for reading text-based input files.')
+def _define_flags() -> None:
+    """Defines command-line flags for this script."""
+    defaults = get_default_shard_config()
+    flags.DEFINE_string('shard_input', '', 'Input files to be sharded')
+    flags.DEFINE_string('shard_output', '',
+                        'Output file pattern for sharded file')
+    flags.DEFINE_string(
+        'shard_key', defaults['shard_key'],
+        'Key or column to shard an input record. Defaults to '
+        'dcid, else Node, else the first column.')
+    flags.DEFINE_integer('shard_key_prefix_length',
+                         defaults['shard_key_prefix_length'],
+                         'Length of key value to use for sharding')
+    flags.DEFINE_integer('shard_count', defaults['shard_count'],
+                         'Number of output shards to generate.')
+    flags.DEFINE_integer(
+        'records_per_shard', defaults['records_per_shard'],
+        'Number of records per output shard if shard_count is not set.')
+    flags.DEFINE_bool('shard_skip_duplicates',
+                      defaults['shard_skip_duplicates'],
+                      'Skip duplicate records.')
+    flags.DEFINE_integer('shard_input_records', defaults['shard_input_records'],
+                         'Limit the number of input records to shard.')
+    flags.DEFINE_list('shard_headers', defaults['shard_headers'],
+                      'Header columns for sharded outputs.')
+    flags.DEFINE_float(
+        'shard_sample_rate', defaults['shard_sample_rate'],
+        'Fraction of shard keys to keep, in the range [0, 1]. All records with '
+        'the same shard key are kept or dropped together.')
+    flags.DEFINE_integer(
+        'shard_threads', defaults['shard_threads'],
+        'Maximum number of parallel threads for reading inputs. Defaults to 50% '
+        'of available CPU cores.')
+    flags.DEFINE_integer(
+        'shard_min_chunk_size', defaults['shard_min_chunk_size'],
+        'Minimum byte size of chunks when splitting a file across parallel workers.'
+    )
+    flags.DEFINE_string(
+        'shard_default_pvs', defaults['shard_default_pvs'],
+        'Default property values to add to a record when the property is missing '
+        'or empty, separated by ";", each as <property>:<value> or '
+        '<property>=<value>. A value can be a comma separated list. Example: '
+        '"typeOf:dcs:StatVarObservation;measurementMethod=dcs:A,dcs:B".')
+    flags.DEFINE_bool(
+        'shard_generate_dcid', defaults['shard_generate_dcid'],
+        'Generate a deterministic dcid for records that do not have a dcid/Node.'
+    )
+    flags.DEFINE_list(
+        'shard_dcid_ignore_props', defaults['shard_dcid_ignore_props'],
+        'Additional properties to ignore when generating a dcid for a record.')
+    flags.DEFINE_string(
+        'shard_output_columns', defaults['shard_output_columns'],
+        'Output columns separated by ";", each as <column> to copy the input '
+        'value, "*" to copy all non-ignored input columns, or '
+        '<column>=<expression>, a fixed value, format template, or Python '
+        'expression with the input columns as variables. Example: '
+        '"dcid;value=int(v)*2;label=f\'{id}-{year}\';typeOf=\'StatVarObservation\'".'
+    )
+    flags.DEFINE_string(
+        'shard_add_columns', defaults['shard_add_columns'],
+        'Columns to add or override in output records while keeping non-ignored '
+        'input columns, separated by ";", each as <column> or '
+        '<column>=<value_or_expression>. Example: '
+        '"dcid;typeOf=dcid:StatVarObservation;observationAbout=dcid:geoId/{fips}".'
+    )
+    flags.DEFINE_list(
+        'shard_ignore_columns', defaults['shard_ignore_columns'],
+        'Column names or regular expressions (e.g. "#input,^#.*") to exclude '
+        'from output records.')
+    flags.DEFINE_string(
+        'shard_encoding', defaults['shard_encoding'],
+        'Optional character encoding for reading text-based input files.')
+
 
 _FORMAT_PLACEHOLDER_RE = re.compile(r'\{([A-Za-z_][A-Za-z0-9_]*)\}')
 _IDENTIFIER_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
@@ -362,33 +375,31 @@ def is_seekable_file(filename: str) -> bool:
 is_splittable_file = is_seekable_file
 
 
-def _get_flag_value(name: str):
-    """Returns the flag value for `name` without mutating global parsed state."""
-    flag = _FLAGS[name]
-    return flag.value if _FLAGS.is_parsed() else flag._value
-
-
 def get_default_shard_config() -> dict:
-    """Returns the default config for sharding based on command-line flags."""
+    """Returns the default config for sharding.
+
+    `_define_flags()` uses these values as the defaults of the command-line
+    flags with the same names.
+    """
     config = get_base_shard_config()
     config.update({
-        'shard_key': _get_flag_value('shard_key'),
-        'shard_key_prefix_length': _get_flag_value('shard_key_prefix_length'),
-        'shard_count': _get_flag_value('shard_count'),
-        'records_per_shard': _get_flag_value('records_per_shard'),
-        'shard_skip_duplicates': _get_flag_value('shard_skip_duplicates'),
-        'shard_input_records': _get_flag_value('shard_input_records'),
-        'shard_headers': _get_flag_value('shard_headers'),
-        'shard_sample_rate': _get_flag_value('shard_sample_rate'),
-        'shard_threads': _get_flag_value('shard_threads'),
-        'shard_min_chunk_size': _get_flag_value('shard_min_chunk_size'),
-        'shard_default_pvs': _get_flag_value('shard_default_pvs'),
-        'shard_generate_dcid': _get_flag_value('shard_generate_dcid'),
-        'shard_dcid_ignore_props': _get_flag_value('shard_dcid_ignore_props'),
-        'shard_output_columns': _get_flag_value('shard_output_columns'),
-        'shard_add_columns': _get_flag_value('shard_add_columns'),
-        'shard_ignore_columns': _get_flag_value('shard_ignore_columns'),
-        'shard_encoding': _get_flag_value('shard_encoding'),
+        'shard_key': '',
+        'shard_key_prefix_length': 0,
+        'shard_count': 0,
+        'records_per_shard': _DEFAULT_RECORDS_PER_SHARD,
+        'shard_skip_duplicates': False,
+        'shard_input_records': sys.maxsize,
+        'shard_headers': [],
+        'shard_sample_rate': 1.0,
+        'shard_threads': _DEFAULT_SHARD_THREADS,
+        'shard_min_chunk_size': _DEFAULT_MIN_CHUNK_SIZE,
+        'shard_default_pvs': '',
+        'shard_generate_dcid': False,
+        'shard_dcid_ignore_props': [],
+        'shard_output_columns': None,
+        'shard_add_columns': '',
+        'shard_ignore_columns': [],
+        'shard_encoding': None,
     })
     return config
 
@@ -1217,8 +1228,15 @@ def main(_):
 
     if not _FLAGS.shard_input:
         logging.fatal('Specify files to be sharded with --shard_input')
-    shard_file(_FLAGS.shard_input, _FLAGS.shard_output)
+    # Config options that have a command-line flag with the same name.
+    config = {
+        name: _FLAGS[name].value
+        for name in get_default_shard_config()
+        if name in _FLAGS
+    }
+    shard_file(_FLAGS.shard_input, _FLAGS.shard_output, config)
 
 
 if __name__ == '__main__':
+    _define_flags()
     app.run(main)

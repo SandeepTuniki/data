@@ -19,7 +19,7 @@ Provides a simple interface to fetch data and metadata from SDMX REST APIs.
 """
 
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, NamedTuple, Optional
 import urllib.parse
 
 from absl import app
@@ -30,11 +30,11 @@ from sdmx_client import SdmxClient
 # Command registry - single source of truth for commands and descriptions
 _COMMAND_HANDLERS = {
     'download-metadata': {
-        'handler': lambda: handle_download_metadata(),
+        'handler': lambda args: handle_download_metadata(args),
         'description': 'Download SDMX metadata (XML format)'
     },
     'download-data': {
-        'handler': lambda: handle_download_data(),
+        'handler': lambda args: handle_download_data(args),
         'description': 'Download SDMX data with optional filters (CSV format)'
     }
 }
@@ -42,23 +42,40 @@ _COMMAND_HANDLERS = {
 # Flag definitions
 FLAGS = flags.FLAGS
 
-# Common flags for both commands
-flags.DEFINE_string('endpoint', None, 'SDMX REST API endpoint URL')
-flags.DEFINE_string('agency', None, 'Agency ID (e.g., OECD.SDD.NAD)')
-flags.DEFINE_string('dataflow', None, 'Dataflow ID')
-flags.DEFINE_string('output_path', None, 'Output file path')
 
-# Data download specific flags - using multi_string for key:value pairs
-flags.DEFINE_multi_string(
-    'key', [],
-    'Data filters as key:value pairs (e.g., --key=FREQ:Q --key=REF_AREA:USA)')
-flags.DEFINE_multi_string(
-    'param', [],
-    'Query parameters as key:value pairs (e.g., --param=startPeriod:2022)')
+def _define_flags() -> None:
+    """Defines command-line flags for this script."""
+    # Common flags for both commands
+    flags.DEFINE_string('endpoint', None, 'SDMX REST API endpoint URL')
+    flags.DEFINE_string('agency', None, 'Agency ID (e.g., OECD.SDD.NAD)')
+    flags.DEFINE_string('dataflow', None, 'Dataflow ID')
+    flags.DEFINE_string('output_path', None, 'Output file path')
 
-# Logging flags
-flags.DEFINE_bool('verbose', False, 'Enable verbose logging')
-flags.DEFINE_bool('quiet', False, 'Only show errors')
+    # Data download specific flags - using multi_string for key:value pairs
+    flags.DEFINE_multi_string(
+        'key', [],
+        'Data filters as key:value pairs (e.g., --key=FREQ:Q --key=REF_AREA:USA)'
+    )
+    flags.DEFINE_multi_string(
+        'param', [],
+        'Query parameters as key:value pairs (e.g., --param=startPeriod:2022)')
+
+    # Logging flags
+    flags.DEFINE_bool('verbose', False, 'Enable verbose logging')
+    flags.DEFINE_bool('quiet', False, 'Only show errors')
+
+
+class DownloadArgs(NamedTuple):
+    """
+    Values of the download flags, passed to the required-flags check and the
+    command handlers.
+    """
+    endpoint: Optional[str]
+    agency: Optional[str]
+    dataflow: Optional[str]
+    output_path: Optional[str]
+    key: List[str]
+    param: List[str]
 
 
 def parse_key_value_pairs(pairs: List[str]) -> Dict[str, Any]:
@@ -124,74 +141,82 @@ def ensure_output_directory(file_path: str) -> None:
         logging.info(f"Created output directory: {directory}")
 
 
-def handle_download_metadata() -> None:
+def handle_download_metadata(args: DownloadArgs) -> None:
     """
     Handle the download-metadata subcommand.
+
+    Args:
+        args: Values of the download flags
 
     Raises:
         ValueError: If endpoint URL is invalid
         Exception: If download fails
     """
     logging.info("Starting metadata download...")
-    logging.info(f"Endpoint: {FLAGS.endpoint}")
-    logging.info(f"Agency: {FLAGS.agency}")
-    logging.info(f"Dataflow: {FLAGS.dataflow}")
-    logging.info(f"Output: {FLAGS.output_path}")
+    logging.info(f"Endpoint: {args.endpoint}")
+    logging.info(f"Agency: {args.agency}")
+    logging.info(f"Dataflow: {args.dataflow}")
+    logging.info(f"Output: {args.output_path}")
 
     # Validate inputs
-    if not validate_url(FLAGS.endpoint):
-        raise ValueError(f"Invalid endpoint URL: {FLAGS.endpoint}")
+    if not validate_url(args.endpoint):
+        raise ValueError(f"Invalid endpoint URL: {args.endpoint}")
 
     # Ensure output directory exists
-    ensure_output_directory(FLAGS.output_path)
+    ensure_output_directory(args.output_path)
 
     # Create client and download metadata
-    client = SdmxClient(FLAGS.endpoint, FLAGS.agency)
-    client.download_metadata(FLAGS.dataflow, FLAGS.output_path)
-    logging.info(f"Successfully downloaded metadata to: {FLAGS.output_path}")
+    client = SdmxClient(args.endpoint, args.agency)
+    client.download_metadata(args.dataflow, args.output_path)
+    logging.info(f"Successfully downloaded metadata to: {args.output_path}")
 
 
-def handle_download_data() -> None:
+def handle_download_data(args: DownloadArgs) -> None:
     """
     Handle the download-data subcommand.
+
+    Args:
+        args: Values of the download flags
 
     Raises:
         ValueError: If endpoint URL is invalid or key:value parsing fails
         Exception: If download fails
     """
     logging.info("Starting data download...")
-    logging.info(f"Endpoint: {FLAGS.endpoint}")
-    logging.info(f"Agency: {FLAGS.agency}")
-    logging.info(f"Dataflow: {FLAGS.dataflow}")
-    logging.info(f"Output: {FLAGS.output_path}")
+    logging.info(f"Endpoint: {args.endpoint}")
+    logging.info(f"Agency: {args.agency}")
+    logging.info(f"Dataflow: {args.dataflow}")
+    logging.info(f"Output: {args.output_path}")
 
     # Parse key and params from multi-value flags
-    data_key = parse_key_value_pairs(FLAGS.key)
-    data_params = parse_key_value_pairs(FLAGS.param)
+    data_key = parse_key_value_pairs(args.key)
+    data_params = parse_key_value_pairs(args.param)
 
     logging.info(f"Key filters: {data_key}")
     logging.info(f"Parameters: {data_params}")
 
     # Validate inputs
-    if not validate_url(FLAGS.endpoint):
-        raise ValueError(f"Invalid endpoint URL: {FLAGS.endpoint}")
+    if not validate_url(args.endpoint):
+        raise ValueError(f"Invalid endpoint URL: {args.endpoint}")
 
     # Ensure output directory exists
-    ensure_output_directory(FLAGS.output_path)
+    ensure_output_directory(args.output_path)
 
     # Create client and download data
-    client = SdmxClient(FLAGS.endpoint, FLAGS.agency)
-    client.download_data_as_csv(FLAGS.dataflow, data_key, data_params,
-                                FLAGS.output_path)
-    logging.info(f"Successfully downloaded data to: {FLAGS.output_path}")
+    client = SdmxClient(args.endpoint, args.agency)
+    client.download_data_as_csv(args.dataflow, data_key, data_params,
+                                args.output_path)
+    logging.info(f"Successfully downloaded data to: {args.output_path}")
 
 
-def validate_required_flags_for_command(command: str) -> None:
+def validate_required_flags_for_command(command: str,
+                                        args: DownloadArgs) -> None:
     """
     Validate that required flags are provided for the given command.
 
     Args:
         command: The command being executed
+        args: Values of the download flags
 
     Raises:
         ValueError: If required flags are missing
@@ -200,7 +225,7 @@ def validate_required_flags_for_command(command: str) -> None:
     missing_flags = []
 
     for flag_name in required_common:
-        flag_value = getattr(FLAGS, flag_name)
+        flag_value = getattr(args, flag_name)
         if not flag_value:
             missing_flags.append(f"--{flag_name}")
 
@@ -209,13 +234,17 @@ def validate_required_flags_for_command(command: str) -> None:
             f"Missing required flags for {command}: {', '.join(missing_flags)}")
 
 
-def setup_logging() -> None:
+def setup_logging(verbose: bool, quiet: bool) -> None:
     """
-    Configure logging based on verbosity flags from FLAGS.
+    Set the logging verbosity and stderr threshold from verbose and quiet.
+
+    Args:
+        verbose: If True, log debug messages (DEBUG instead of INFO)
+        quiet: If True, log only errors (ERROR); takes precedence over verbose
     """
-    if FLAGS.quiet:
+    if quiet:
         level = logging.ERROR
-    elif FLAGS.verbose:
+    elif verbose:
         level = logging.DEBUG
     else:
         level = logging.INFO
@@ -255,14 +284,22 @@ def main(argv) -> None:
         return
 
     # Setup logging
-    setup_logging()
+    setup_logging(verbose=FLAGS.verbose, quiet=FLAGS.quiet)
+
+    args = DownloadArgs(endpoint=FLAGS.endpoint,
+                        agency=FLAGS.agency,
+                        dataflow=FLAGS.dataflow,
+                        output_path=FLAGS.output_path,
+                        key=FLAGS.key,
+                        param=FLAGS.param)
 
     # Validate required flags for the command
-    validate_required_flags_for_command(command)
+    validate_required_flags_for_command(command, args)
 
     # Route to appropriate handler using the mapping
-    _COMMAND_HANDLERS[command]['handler']()
+    _COMMAND_HANDLERS[command]['handler'](args)
 
 
 if __name__ == "__main__":
+    _define_flags()
     app.run(main)
